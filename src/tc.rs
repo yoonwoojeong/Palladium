@@ -2304,3 +2304,220 @@ impl<'e> Checker<'e> {
         }
     }
 }
+
+#[cfg(test)]
+mod infer_ctx_tests {
+    use super::*;
+    use crate::parse;
+
+    /// Constants: `Nat : Type`, `f : Nat -> Nat -> Nat`, `K : Nat -> Nat -> Nat -> Nat`,
+    /// `z : Nat`, `D : Nat -> Type`, `d : (n : Nat) -> D n`.
+    const ENV: &str = r#"{"meta": {"exporter": {"name": "lean4export", "version": "3.1.0"}, "format": {"version": "3.1.0"}, "lean": {"githash": "x", "version": "4.34.1"}}}
+{"il":1,"succ":0}
+{"in":1,"str":{"pre":0,"str":"Nat"}}
+{"in":2,"str":{"pre":0,"str":"f"}}
+{"in":3,"str":{"pre":0,"str":"D"}}
+{"in":4,"str":{"pre":0,"str":"d"}}
+{"in":5,"str":{"pre":0,"str":"K"}}
+{"in":6,"str":{"pre":0,"str":"z"}}
+{"ie":0,"sort":1}
+{"const":{"name":1,"us":[]},"ie":1}
+{"forallE":{"binderInfo":"default","body":1,"name":1,"type":1},"ie":2}
+{"forallE":{"binderInfo":"default","body":2,"name":1,"type":1},"ie":3}
+{"forallE":{"binderInfo":"default","body":3,"name":1,"type":1},"ie":4}
+{"forallE":{"binderInfo":"default","body":0,"name":1,"type":1},"ie":5}
+{"const":{"name":3,"us":[]},"ie":6}
+{"bvar":0,"ie":7}
+{"app":{"arg":7,"fn":6},"ie":8}
+{"forallE":{"binderInfo":"default","body":8,"name":1,"type":1},"ie":9}
+{"axiom":{"name":1,"levelParams":[],"type":0,"isUnsafe":false}}
+{"axiom":{"name":2,"levelParams":[],"type":3,"isUnsafe":false}}
+{"axiom":{"name":5,"levelParams":[],"type":4,"isUnsafe":false}}
+{"axiom":{"name":3,"levelParams":[],"type":5,"isUnsafe":false}}
+{"axiom":{"name":4,"levelParams":[],"type":9,"isUnsafe":false}}
+{"axiom":{"name":6,"levelParams":[],"type":1,"isUnsafe":false}}
+"#;
+
+    /// A checker that sees every constant of the test file.
+    fn test_checker(env: &Env) -> Checker<'_> {
+        let mut tc = Checker::new(env);
+        tc.pos = u32::MAX;
+        tc
+    }
+
+    fn test_env() -> Env {
+        parse::load(ENV.as_bytes()).expect("test environment loads")
+    }
+
+    fn konst(tc: &mut Checker, env: &Env, s: &str) -> TermId {
+        let n = env.raw.find_name(&[s]).expect("test constant");
+        let lv = tc.store.mk_levels(&[]);
+        tc.store.mk_const(n, lv)
+    }
+
+    fn bv(tc: &mut Checker, i: u32) -> TermId {
+        tc.store.mk_bvar(i)
+    }
+
+    fn app(tc: &mut Checker, f: TermId, args: &[TermId]) -> TermId {
+        tc.store.mk_app_n(f, args)
+    }
+
+    fn type1(tc: &mut Checker) -> TermId {
+        let z = tc.store.mk_zero();
+        let s = tc.store.mk_succ(z);
+        tc.store.mk_sort(s)
+    }
+
+    /// Both modes agree with the substitution-based oracle and with the expected type (by id).
+    fn check_both(tc: &mut Checker, t: TermId, expect: TermId) {
+        let shown = tc.show(t);
+        for check in [true, false] {
+            let new = tc.infer(t, check).unwrap_or_else(|e| panic!("infer {shown}: {e:?}"));
+            let old = tc.infer_subst(t, check).unwrap_or_else(|e| panic!("infer_subst {shown}: {e:?}"));
+            assert!(new == old || tc.is_def_eq(new, old).unwrap(), "oracle mismatch on {shown}");
+            assert_eq!(new, expect, "type of {shown} (check={check})");
+        }
+        assert!(tc.ctx.is_empty(), "context left non-empty");
+    }
+
+    #[test]
+    fn nested_lambdas_reference_every_binder() {
+        // λx y z. K x y z : Nat -> Nat -> Nat -> Nat
+        let env = test_env();
+        let mut tc = test_checker(&env);
+        let nat = konst(&mut tc, &env, "Nat");
+        let k = konst(&mut tc, &env, "K");
+        let (x, y, z) = (bv(&mut tc, 2), bv(&mut tc, 1), bv(&mut tc, 0));
+        let body = app(&mut tc, k, &[x, y, z]);
+        let l3 = tc.store.mk_lam(nat, body);
+        let l2 = tc.store.mk_lam(nat, l3);
+        let t = tc.store.mk_lam(nat, l2);
+        let p1 = tc.store.mk_pi(nat, nat);
+        let p2 = tc.store.mk_pi(nat, p1);
+        let expect = tc.store.mk_pi(nat, p2);
+        check_both(&mut tc, t, expect);
+    }
+
+    #[test]
+    fn lets_separated_by_applications() {
+        // let x := z; K (let y := x; K y x z) x x     : Nat
+        let env = test_env();
+        let mut tc = test_checker(&env);
+        let nat = konst(&mut tc, &env, "Nat");
+        let k = konst(&mut tc, &env, "K");
+        let z = konst(&mut tc, &env, "z");
+        // Under the outer let, x = #0. The inner let's value is x; under the inner let, y = #0, x = #1.
+        let x_value = bv(&mut tc, 0);
+        let (y, x_inner) = (bv(&mut tc, 0), bv(&mut tc, 1));
+        let inner_body = app(&mut tc, k, &[y, x_inner, z]);
+        let inner = tc.store.mk_let(nat, x_value, inner_body);
+        let x_outer = bv(&mut tc, 0);
+        let arg = app(&mut tc, k, &[inner, x_outer, x_outer]);
+        let t = tc.store.mk_let(nat, z, arg);
+        check_both(&mut tc, t, nat);
+    }
+
+    #[test]
+    fn dependent_application_under_binders() {
+        // λn. d n  and  λn. (λm. d m) n   both : Π n : Nat, D n
+        let env = test_env();
+        let mut tc = test_checker(&env);
+        let nat = konst(&mut tc, &env, "Nat");
+        let d = konst(&mut tc, &env, "d");
+        let dd = konst(&mut tc, &env, "D");
+        let b0 = bv(&mut tc, 0);
+        let dn = tc.store.mk_app(d, b0);
+        let t1 = tc.store.mk_lam(nat, dn);
+        let inner_lam_body = {
+            let b0 = bv(&mut tc, 0);
+            tc.store.mk_app(d, b0)
+        };
+        let inner_lam = tc.store.mk_lam(nat, inner_lam_body);
+        let b0b = bv(&mut tc, 0);
+        let t2_body = tc.store.mk_app(inner_lam, b0b);
+        let t2 = tc.store.mk_lam(nat, t2_body);
+        let b0c = bv(&mut tc, 0);
+        let dep = tc.store.mk_app(dd, b0c);
+        let expect = tc.store.mk_pi(nat, dep);
+        check_both(&mut tc, t1, expect);
+        check_both(&mut tc, t2, expect);
+    }
+
+    #[test]
+    fn binder_type_mentions_outer_binder() {
+        // λ (A : Type) (a : A). a   :  Π (A : Type) (a : A), A
+        // and the same with a let in the body: λ A a. let y : A := a; y
+        let env = test_env();
+        let mut tc = test_checker(&env);
+        let ty = type1(&mut tc);
+        let a_ty = bv(&mut tc, 0);
+        let body = bv(&mut tc, 0);
+        let inner = tc.store.mk_lam(a_ty, body);
+        let t = tc.store.mk_lam(ty, inner);
+        let a_ty2 = bv(&mut tc, 0);
+        let a_res = bv(&mut tc, 1);
+        let p_inner = tc.store.mk_pi(a_ty2, a_res);
+        let expect = tc.store.mk_pi(ty, p_inner);
+        check_both(&mut tc, t, expect);
+
+        let a_ty3 = bv(&mut tc, 0);
+        let let_val = bv(&mut tc, 0);
+        let let_ty = bv(&mut tc, 1);
+        let let_body = bv(&mut tc, 0);
+        let lt = tc.store.mk_let(let_ty, let_val, let_body);
+        let inner2 = tc.store.mk_lam(a_ty3, lt);
+        let t2 = tc.store.mk_lam(ty, inner2);
+        check_both(&mut tc, t2, expect);
+    }
+
+    #[test]
+    fn beta_redex_infer_only_spine() {
+        // (λ n. d n) z  : D z   (infer-only spine with a lambda head and a closed argument)
+        let env = test_env();
+        let mut tc = test_checker(&env);
+        let nat = konst(&mut tc, &env, "Nat");
+        let d = konst(&mut tc, &env, "d");
+        let dd = konst(&mut tc, &env, "D");
+        let z = konst(&mut tc, &env, "z");
+        let b0 = bv(&mut tc, 0);
+        let dn = tc.store.mk_app(d, b0);
+        let lam = tc.store.mk_lam(nat, dn);
+        let t = tc.store.mk_app(lam, z);
+        let expect = tc.store.mk_app(dd, z);
+        assert_eq!(tc.infer(t, false).unwrap(), expect);
+        assert!(tc.ctx.is_empty());
+    }
+
+    #[test]
+    fn failing_body_pops_context() {
+        // λ x : Nat. z x   is ill typed (z is not a function); the context must be unwound
+        let env = test_env();
+        let mut tc = test_checker(&env);
+        let nat = konst(&mut tc, &env, "Nat");
+        let z = konst(&mut tc, &env, "z");
+        let b0 = bv(&mut tc, 0);
+        let body = tc.store.mk_app(z, b0);
+        let t = tc.store.mk_lam(nat, body);
+        assert!(tc.infer(t, true).is_err());
+        assert!(tc.ctx.is_empty());
+        assert!(tc.infer(t, false).is_err());
+        assert!(tc.ctx.is_empty());
+    }
+
+    #[test]
+    fn loose_bvars_are_rejected() {
+        let env = test_env();
+        let mut tc = test_checker(&env);
+        let nat = konst(&mut tc, &env, "Nat");
+        let b1 = bv(&mut tc, 1);
+        assert!(tc.infer(b1, true).is_err());
+        let x = tc.store.mk_local(0, nat);
+        tc.ctx_push(x);
+        let b0 = bv(&mut tc, 0);
+        assert_eq!(tc.inst_ctx(b0).unwrap(), x);
+        assert!(tc.inst_ctx(b1).is_err());
+        tc.ctx_pop();
+        assert!(tc.ctx.is_empty());
+    }
+}
