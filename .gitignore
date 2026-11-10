@@ -1,0 +1,4 @@
+/target
+*.ndjson
+/arena-tests
+/.claude/
