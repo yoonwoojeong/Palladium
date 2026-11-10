@@ -385,6 +385,7 @@ impl<'e> Checker<'e> {
         if self.store.levels(ls).len() != info.level_params.len() {
             return reject(format!("incorrect number of universe levels for '{}'", self.env.raw.name_to_string(n)));
         }
+        self.dbg(47);
         let ty = self.import_expr(info.ty);
         let t = self.subst_levels(ty, &info.level_params, ls);
         self.const_ty.insert((n, ls), t);
@@ -584,6 +585,29 @@ impl<'e> Checker<'e> {
         m
     }
 
+    /// `ctx_dep_id` for `inst_rec(t, off)`: only the bvars of `t` at or above `off` matter, and
+    /// bvar `off + k` refers to the context entry `k` from the top.
+    fn ctx_dep_id_off(&mut self, t: TermId, off: u32) -> Option<u32> {
+        let m = self.loose_mask(t);
+        if m >> 63 != 0 {
+            return self.ctx_suffix_id(self.store.lbr(t).checked_sub(off)?);
+        }
+        let len = self.ctx.len();
+        let mut bits = if off >= 64 { 0 } else { m & (!0u64 << off) };
+        let mut sid = 0u32;
+        while bits != 0 {
+            let i = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            let k = i - off as usize;
+            if k >= len {
+                return None;
+            }
+            let next = self.ctx_sintern.len() as u32 + 1;
+            sid = *self.ctx_sintern.entry((self.ctx[len - 1 - k], sid)).or_insert(next);
+        }
+        Some(sid)
+    }
+
     /// Interned key of the context entries that `t` (open) actually refers to: the entries of
     /// its loose bvars, innermost first. `None` when a bvar is out of range.
     fn ctx_dep_id(&mut self, t: TermId) -> Option<u32> {
@@ -669,7 +693,11 @@ impl<'e> Checker<'e> {
         if self.store.lbr(t) <= off {
             return Ok(t);
         }
-        let key = (t, off, self.ctx_cur_id());
+        let sid = match self.ctx_dep_id_off(t, off) {
+            Some(s) => s,
+            None => return reject("loose bound variable"),
+        };
+        let key = (t, off, sid);
         if let Some(&r) = self.inst_memo.get(&key) {
             return Ok(r);
         }
@@ -870,23 +898,49 @@ impl<'e> Checker<'e> {
         self.inst_pending(ft, &args[j..])
     }
 
+    /// Lambda telescope (as `infer_lambda` of the reference kernel): all leading binders are
+    /// opened, the body is inferred once, and the body type is abstracted over all binders at
+    /// once, so the work is linear in the term rather than in (binders x body type).
     fn infer_lambda_ctx(&mut self, t: TermId, check: bool) -> R<TermId> {
-        let Term::Lam(ty, b) = self.store.get(t) else { return fault("infer_lambda") };
-        let dom = self.inst_ctx(ty)?;
-        if check {
-            let s = self.infer_ctx(dom, true)?;
-            self.ensure_sort(s)?;
+        let mut xs: Vec<TermId> = Vec::new();
+        let mut doms: Vec<TermId> = Vec::new();
+        let mut cur = t;
+        let mut err: Option<Fail> = None;
+        while let Term::Lam(ty, b) = self.store.get(cur) {
+            let dom = match self.inst_ctx(ty) {
+                Ok(d) => d,
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
+            };
+            if check {
+                let checked = self.infer_ctx(dom, true).and_then(|s| self.ensure_sort(s).map(|_| ()));
+                if let Err(e) = checked {
+                    err = Some(e);
+                    break;
+                }
+            }
+            let x = self.fresh_ctx_local(t, dom);
+            self.ctx_push(x);
+            xs.push(x);
+            doms.push(dom);
+            cur = b;
         }
-        if self.store.lbr(b) == 0 {
-            let r = self.infer_ctx(b, check)?;
-            return Ok(self.store.mk_pi(dom, r));
+        let r = match err {
+            Some(e) => Err(e),
+            None => self.infer_ctx(cur, check),
+        };
+        for _ in 0..xs.len() {
+            self.ctx_pop();
         }
-        let x = self.fresh_ctx_local(t, dom);
-        self.ctx_push(x);
-        let r = self.infer_ctx(b, check);
-        self.ctx_pop();
-        let r = self.store.abstract_locals(r?, &[x]);
-        Ok(self.store.mk_pi(dom, r))
+        let r = r?;
+        let mut res = self.store.abstract_locals(r, &xs);
+        for i in (0..xs.len()).rev() {
+            let d = self.store.abstract_locals(doms[i], &xs[..i]);
+            res = self.store.mk_pi(d, res);
+        }
+        Ok(res)
     }
 
     fn infer_pi_ctx(&mut self, t: TermId, check: bool) -> R<TermId> {
@@ -2298,7 +2352,7 @@ impl<'e> Checker<'e> {
             "whnf_core_defeq", "proof_irrel_infer", "binding", "lazy_delta_calls", "lazy_steps", "proj_lazy",
             "-", "args_loop", "eta_struct_ty", "eta_struct_proj", "app_fn_args", "bind_dom", "bind_body", "eta_exp",
             "pf_irrel_ty", "check_arg", "-", "tnn_rec", "proj_lazy_site", "nat_lazy", "offset", "unit_like_ty",
-            "string_exp", "-", "-", "infer_closed_hit", "infer_closed_miss", "infer_open_hit", "infer_open_miss", "-",
+            "string_exp", "-", "-", "infer_closed_hit", "infer_closed_miss", "infer_open_hit", "infer_open_miss", "const_ty_miss",
         ];
         let mut line = String::from("defeq-counters:");
         for (i, n) in NAMES.iter().enumerate() {

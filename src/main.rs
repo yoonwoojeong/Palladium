@@ -86,11 +86,17 @@ fn decl_name(env: &Env, pos: usize) -> String {
 /// Checks declarations until the shared counter is exhausted.
 fn worker(env: &Env, counter: &AtomicUsize, fault: &Mutex<Option<String>>, total: usize) {
     let trace = std::env::var_os("PALLADIUM_TRACE").is_some();
+    let only_pos: Option<usize> = std::env::var("PALLADIUM_ONLY_POS").ok().and_then(|v| v.parse().ok());
     let mut checker = Checker::new(env);
     loop {
         let p = counter.fetch_add(1, Ordering::Relaxed);
         if p >= total {
             break;
+        }
+        // Diagnostics only: `PALLADIUM_ONLY_POS=<n>` checks just declaration n (the environment
+        // still holds all declarations, so n is checked as it would be in the full run).
+        if only_pos.map_or(false, |o| o != p) {
+            continue;
         }
         if checker.store.num_terms() > RESET_TERMS {
             checker.reset();
