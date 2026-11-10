@@ -61,6 +61,37 @@ pub type FxBuild = BuildHasherDefault<FxHasher>;
 pub type FxHashMap<K, V> = std::collections::HashMap<K, V, FxBuild>;
 pub type FxHashSet<K> = std::collections::HashSet<K, FxBuild>;
 
+/// Map from dense ids (all >= 1, as `TermId`s are) to ids. `0` means absent, so a lookup is
+/// one bounds check and one load. `clear` is O(1) and keeps the allocation.
+#[derive(Default)]
+pub struct DenseMap {
+    v: Vec<u32>,
+}
+
+impl DenseMap {
+    #[inline]
+    pub fn get(&self, k: u32) -> Option<u32> {
+        match self.v.get(k as usize) {
+            Some(&x) if x != 0 => Some(x),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn insert(&mut self, k: u32, val: u32) {
+        let i = k as usize;
+        if i >= self.v.len() {
+            let n = (i + 1).max(self.v.len() * 2);
+            self.v.resize(n, 0);
+        }
+        self.v[i] = val;
+    }
+
+    pub fn clear(&mut self) {
+        self.v.clear();
+    }
+}
+
 /// A good 64-bit mixing function of two words (used for hash-consing).
 #[inline]
 pub fn mix(a: u64, b: u64) -> u64 {

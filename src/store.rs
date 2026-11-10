@@ -80,6 +80,25 @@ pub(crate) struct Meta {
 
 const META_LEAF: Meta = Meta { lbr: 0, local_ub: 0, has_param: false };
 
+/// A stored term: its node and its metadata in one record (one cache line per visit).
+#[derive(Clone, Copy)]
+pub(crate) struct Entry {
+    pub(crate) tag: u8,
+    pub(crate) has_param: bool,
+    pub(crate) lbr: u32,
+    pub(crate) local_ub: u32,
+    pub(crate) a: u32,
+    pub(crate) b: u32,
+    pub(crate) c: u32,
+}
+
+impl Entry {
+    #[inline]
+    fn same_node(&self, n: &Node) -> bool {
+        self.tag == n.tag && self.a == n.a && self.b == n.b && self.c == n.c
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LNode {
     pub(crate) tag: u8,
@@ -123,10 +142,11 @@ fn memo_key(t: TermId, off: u32) -> u64 {
     ((t as u64) << 32) | off as u64
 }
 
-/// Open-addressing (linear probing) set of ids, load factor at most 1/2.
-/// The table stores ids (0 = empty); hashes are recomputed by the owner on growth.
+/// Open-addressing (linear probing) set of ids, load factor at most 1/2. Each slot packs
+/// the 32-bit hash of its id with the id (`hash << 32 | id`; `0` = empty, ids are >= 1), so
+/// probes reject most mismatches without touching the node arrays.
 pub(crate) struct Table {
-    slots: Vec<u32>,
+    slots: Vec<u64>,
     len: usize,
 }
 
@@ -136,9 +156,7 @@ impl Table {
     }
 
     pub(crate) fn clear(&mut self) {
-        for s in self.slots.iter_mut() {
-            *s = 0;
-        }
+        self.slots.fill(0);
         self.len = 0;
     }
 
@@ -149,76 +167,142 @@ impl Table {
         let mask = self.slots.len() - 1;
         let mut i = h as usize & mask;
         loop {
-            let id = self.slots[i];
-            if id == 0 {
+            let s = self.slots[i];
+            if s == 0 {
                 return Err(i);
             }
-            if eq(id) {
-                return Ok(id);
+            if (s >> 32) as u32 == h {
+                let id = s as u32;
+                if eq(id) {
+                    return Ok(id);
+                }
             }
             i = (i + 1) & mask;
         }
     }
 
     /// Inserts `id` (hash `h`) into the empty `slot` returned by `find`, growing first if
-    /// the load factor would exceed 1/2. `hash_of` recomputes the hash of an existing id.
+    /// the load factor would exceed 1/2.
     #[inline]
-    pub(crate) fn insert_at(&mut self, slot: usize, id: u32, h: u32, hash_of: impl Fn(u32) -> u32) {
-        if (self.len + 1) * 2 > self.slots.len() {
+    pub(crate) fn insert_at(&mut self, slot: usize, id: u32, h: u32) {
+        let packed = ((h as u64) << 32) | id as u64;
+        if (self.len + 1) * 4 > self.slots.len() * 3 {
             let new_cap = self.slots.len() * 2;
             let old = std::mem::replace(&mut self.slots, vec![0; new_cap]);
-            for old_id in old.into_iter().filter(|&x| x != 0) {
-                place(&mut self.slots, hash_of(old_id), old_id);
+            for s in old.into_iter().filter(|&x| x != 0) {
+                place(&mut self.slots, (s >> 32) as u32, s);
             }
-            place(&mut self.slots, h, id);
+            place(&mut self.slots, h, packed);
         } else {
-            self.slots[slot] = id;
+            self.slots[slot] = packed;
         }
         self.len += 1;
     }
 }
 
-fn place(slots: &mut [u32], h: u32, id: u32) {
+#[inline]
+fn place(slots: &mut [u64], h: u32, packed: u64) {
     let mask = slots.len() - 1;
     let mut i = h as usize & mask;
     while slots[i] != 0 {
         i = (i + 1) & mask;
     }
-    slots[i] = id;
+    slots[i] = packed;
 }
 
-/// Memo table with O(1) logical clear: entries of an older generation are ignored.
-/// Every top-level traversal calls `begin` first.
-pub(crate) struct Memo<K> {
-    map: FxHashMap<K, (u32, u32)>,
+/// Exact memo table `(key -> u32)` with O(1) logical clear: an entry is live only if its
+/// generation equals the current one, and `begin` bumps the generation. Open addressing
+/// with linear probing; the table doubles when half full (within a traversal too), so no
+/// result of the current traversal is ever dropped unless `MEMO_MAX` is reached.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct MemoEnt {
+    key: u64,
+    val: u32,
     gen: u32,
 }
 
-impl<K: std::hash::Hash + Eq + Copy> Memo<K> {
+const MEMO_MIN: usize = 1 << 10;
+const MEMO_MAX: usize = 1 << 22;
+
+pub(crate) struct Memo {
+    ents: Vec<MemoEnt>,
+    gen: u32,
+    live: usize,
+}
+
+impl Memo {
     fn new() -> Self {
-        Memo { map: FxHashMap::default(), gen: 0 }
+        Memo { ents: vec![MemoEnt::default(); MEMO_MIN], gen: 0, live: 0 }
     }
+    /// Starts a new traversal: all previous entries become dead.
+    #[inline]
     fn begin(&mut self) {
         self.gen = self.gen.wrapping_add(1);
-        if self.gen == 0 || self.map.len() > (1 << 20) {
-            self.map.clear();
+        self.live = 0;
+        if self.gen == 0 {
+            self.ents.fill(MemoEnt::default());
             self.gen = 1;
         }
     }
     fn clear(&mut self) {
-        self.map.clear();
+        self.ents.fill(MemoEnt::default());
         self.gen = 0;
+        self.live = 0;
     }
     #[inline]
-    fn get(&self, k: K) -> Option<u32> {
-        match self.map.get(&k) {
-            Some(&(g, r)) if g == self.gen => Some(r),
-            _ => None,
+    fn slot(key: u64, mask: usize) -> usize {
+        (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize & mask
+    }
+    #[inline]
+    fn get(&self, k: u64) -> Option<u32> {
+        let mask = self.ents.len() - 1;
+        let mut i = Self::slot(k, mask);
+        loop {
+            let e = self.ents[i];
+            if e.gen != self.gen {
+                return None;
+            }
+            if e.key == k {
+                return Some(e.val);
+            }
+            i = (i + 1) & mask;
         }
     }
     #[inline]
-    fn put(&mut self, k: K, r: u32) {
-        self.map.insert(k, (self.gen, r));
+    fn put(&mut self, k: u64, r: u32) {
+        if (self.live + 1) * 2 > self.ents.len() {
+            if self.ents.len() >= MEMO_MAX {
+                return; // lossy at the limit: only costs recomputation
+            }
+            self.grow();
+        }
+        let mask = self.ents.len() - 1;
+        let mut i = Self::slot(k, mask);
+        loop {
+            let e = self.ents[i];
+            if e.gen != self.gen {
+                self.ents[i] = MemoEnt { key: k, val: r, gen: self.gen };
+                self.live += 1;
+                return;
+            }
+            if e.key == k {
+                self.ents[i].val = r;
+                return;
+            }
+            i = (i + 1) & mask;
+        }
+    }
+    fn grow(&mut self) {
+        let n = self.ents.len() * 2;
+        let old = std::mem::replace(&mut self.ents, vec![MemoEnt::default(); n]);
+        let mask = n - 1;
+        for e in old.into_iter().filter(|e| e.gen == self.gen) {
+            let mut i = Self::slot(e.key, mask);
+            while self.ents[i].gen == self.gen {
+                i = (i + 1) & mask;
+            }
+            self.ents[i] = e;
+        }
     }
 }
 
@@ -243,8 +327,7 @@ impl<'a> AbsCtx<'a> {
 /// Hash-consed store of terms, universe levels, universe-level lists, locals and nat
 /// literals. Every node carries its metadata (`lbr`, `local_ub`, `has_param`).
 pub struct Store {
-    pub(crate) nodes: Vec<Node>,
-    pub(crate) meta: Vec<Meta>,
+    pub(crate) nodes: Vec<Entry>,
     pub(crate) term_tab: Table,
     pub(crate) lnodes: Vec<LNode>,
     pub(crate) lmeta: Vec<LMeta>,
@@ -259,9 +342,11 @@ pub struct Store {
     pub(crate) local_tab: Table,
     pub(crate) nat_vals: Vec<BigNat>,
     pub(crate) nat_map: FxHashMap<BigNat, NatId>,
-    pub(crate) inst_memo: Memo<u64>,
-    pub(crate) abs_memo: Memo<u64>,
-    pub(crate) subst_memo: Memo<TermId>,
+    pub(crate) inst_memo: Memo,
+    pub(crate) abs_memo: Memo,
+    pub(crate) subst_memo: Memo,
+    /// Shared stack for application spines during substitution (used with a base index).
+    spine: Vec<TermId>,
     pub(crate) leq_cache: FxHashMap<(LevelId, LevelId), bool>,
 }
 
@@ -275,7 +360,6 @@ impl Store {
     pub fn new() -> Store {
         let mut s = Store {
             nodes: Vec::new(),
-            meta: Vec::new(),
             term_tab: Table::new(),
             lnodes: Vec::new(),
             lmeta: Vec::new(),
@@ -293,6 +377,7 @@ impl Store {
             inst_memo: Memo::new(),
             abs_memo: Memo::new(),
             subst_memo: Memo::new(),
+            spine: Vec::new(),
             leq_cache: FxHashMap::default(),
         };
         s.clear();
@@ -302,9 +387,7 @@ impl Store {
     /// Drops every node, keeping allocations.
     pub fn clear(&mut self) {
         self.nodes.clear();
-        self.nodes.push(Node { tag: T_DUMMY, a: 0, b: 0, c: 0 });
-        self.meta.clear();
-        self.meta.push(META_LEAF);
+        self.nodes.push(Entry { tag: T_DUMMY, has_param: false, lbr: 0, local_ub: 0, a: 0, b: 0, c: 0 });
         self.term_tab.clear();
         self.lnodes.clear();
         self.lnodes.push(LNode { tag: L_DUMMY, a: 0, b: 0 });
@@ -329,6 +412,7 @@ impl Store {
         self.inst_memo.clear();
         self.abs_memo.clear();
         self.subst_memo.clear();
+        self.spine.clear();
         self.leq_cache.clear();
     }
 
@@ -361,28 +445,28 @@ impl Store {
     /// Loose bound variable range: 0 means closed.
     #[inline]
     pub fn lbr(&self, t: TermId) -> u32 {
-        self.meta[t as usize].lbr
+        self.nodes[t as usize].lbr
     }
 
     /// 0 if the term contains no locals, else 1 + the largest local depth occurring in it.
     #[inline]
     pub fn local_ub(&self, t: TermId) -> u32 {
-        self.meta[t as usize].local_ub
+        self.nodes[t as usize].local_ub
     }
 
     #[inline]
     pub fn has_param(&self, t: TermId) -> bool {
-        self.meta[t as usize].has_param
+        self.nodes[t as usize].has_param
     }
 
     #[inline]
     pub fn is_closed(&self, t: TermId) -> bool {
-        self.meta[t as usize].lbr == 0
+        self.nodes[t as usize].lbr == 0
     }
 
     #[inline]
     pub fn has_loose_bvars(&self, t: TermId) -> bool {
-        self.meta[t as usize].lbr > 0
+        self.nodes[t as usize].lbr > 0
     }
 
     pub fn nat_value(&self, id: NatId) -> &BigNat {
@@ -409,14 +493,20 @@ impl Store {
 
     #[inline]
     fn intern_term(&mut self, n: Node, m: Meta) -> TermId {
-        match self.term_tab.find(hash_node(&n), |id| self.nodes[id as usize] == n) {
+        match self.term_tab.find(hash_node(&n), |id| self.nodes[id as usize].same_node(&n)) {
             Ok(id) => id,
             Err(slot) => {
                 let id = self.nodes.len() as u32;
-                self.nodes.push(n);
-                self.meta.push(m);
-                let nodes = &self.nodes;
-                self.term_tab.insert_at(slot, id, hash_node(&n), |i| hash_node(&nodes[i as usize]));
+                self.nodes.push(Entry {
+                    tag: n.tag,
+                    has_param: m.has_param,
+                    lbr: m.lbr,
+                    local_ub: m.local_ub,
+                    a: n.a,
+                    b: n.b,
+                    c: n.c,
+                });
+                self.term_tab.insert_at(slot, id, hash_node(&n));
                 id
             }
         }
@@ -450,8 +540,8 @@ impl Store {
 
     #[inline]
     pub fn mk_app(&mut self, f: TermId, a: TermId) -> TermId {
-        let mf = self.meta[f as usize];
-        let ma = self.meta[a as usize];
+        let mf = self.nodes[f as usize];
+        let ma = self.nodes[a as usize];
         let m = Meta {
             lbr: mf.lbr.max(ma.lbr),
             local_ub: mf.local_ub.max(ma.local_ub),
@@ -474,8 +564,8 @@ impl Store {
 
     #[inline]
     fn binder_meta(&self, ty: TermId, body: TermId) -> Meta {
-        let mt = self.meta[ty as usize];
-        let mb = self.meta[body as usize];
+        let mt = self.nodes[ty as usize];
+        let mb = self.nodes[body as usize];
         Meta {
             lbr: mt.lbr.max(mb.lbr.saturating_sub(1)),
             local_ub: mt.local_ub.max(mb.local_ub),
@@ -484,9 +574,9 @@ impl Store {
     }
 
     pub fn mk_let(&mut self, ty: TermId, val: TermId, body: TermId) -> TermId {
-        let mt = self.meta[ty as usize];
-        let mv = self.meta[val as usize];
-        let mb = self.meta[body as usize];
+        let mt = self.nodes[ty as usize];
+        let mv = self.nodes[val as usize];
+        let mb = self.nodes[body as usize];
         let m = Meta {
             lbr: mt.lbr.max(mv.lbr).max(mb.lbr.saturating_sub(1)),
             local_ub: mt.local_ub.max(mv.local_ub).max(mb.local_ub),
@@ -496,7 +586,7 @@ impl Store {
     }
 
     pub fn mk_proj(&mut self, name: NameId, idx: u32, e: TermId) -> TermId {
-        let me = self.meta[e as usize];
+        let me = Meta { lbr: self.nodes[e as usize].lbr, local_ub: self.nodes[e as usize].local_ub, has_param: self.nodes[e as usize].has_param };
         self.intern_term(Node { tag: T_PROJ, a: name, b: idx, c: e }, me)
     }
 
@@ -541,12 +631,11 @@ impl Store {
                 let id = self.local_depth.len() as u32;
                 self.local_depth.push(depth);
                 self.local_ty.push(ty);
-                let (ds, ts) = (&self.local_depth, &self.local_ty);
-                self.local_tab.insert_at(slot, id, h, |i| hash_local(ds[i as usize], ts[i as usize]));
+                self.local_tab.insert_at(slot, id, h);
                 id
             }
         };
-        let hp = self.meta[ty as usize].has_param;
+        let hp = self.nodes[ty as usize].has_param;
         self.intern_term(
             Node { tag: T_LOCAL, a: lid, b: 0, c: 0 },
             Meta { lbr: 0, local_ub: depth.saturating_add(1), has_param: hp },
@@ -576,12 +665,7 @@ impl Store {
                 self.list_len.push(ls.len() as u32);
                 let hp = ls.iter().any(|&l| self.lmeta[l as usize].has_param);
                 self.list_has_param.push(hp);
-                let (st, ln, data) = (&self.list_start, &self.list_len, &self.list_data);
-                self.list_tab.insert_at(slot, id, h, |i| {
-                    let s = st[i as usize] as usize;
-                    let n = ln[i as usize] as usize;
-                    hash_list(&data[s..s + n])
-                });
+                self.list_tab.insert_at(slot, id, h);
                 id
             }
         }
@@ -630,30 +714,13 @@ impl Store {
         n
     }
 
-    /// Walks the application spine starting at `t` (which must be an App) while the function
-    /// position is an App satisfying `keep`. Pushes every visited spine node (outermost first)
-    /// and returns the first function-position term that is not collected.
-    #[inline]
-    fn collect_spine(&self, t: TermId, spine: &mut Vec<TermId>, keep: impl Fn(&Meta) -> bool) -> TermId {
-        let mut cur = t;
-        loop {
-            spine.push(cur);
-            let f = self.nodes[cur as usize].a;
-            if self.nodes[f as usize].tag == T_APP && keep(&self.meta[f as usize]) {
-                cur = f;
-            } else {
-                return f;
-            }
-        }
-    }
-
     // ----- instantiate -----------------------------------------------------------
 
     /// Simultaneous substitution of the outermost `xs.len()` loose bound variables.
     /// Loose bvar `i` becomes `xs[xs.len()-1-i]` if `i < xs.len()`, else `BVar(i - xs.len())`.
     /// All `xs` must be closed.
     pub fn instantiate(&mut self, t: TermId, xs: &[TermId]) -> TermId {
-        if xs.is_empty() || self.meta[t as usize].lbr == 0 {
+        if xs.is_empty() || self.nodes[t as usize].lbr == 0 {
             return t;
         }
         debug_assert!(xs.iter().all(|&x| self.is_closed(x)), "instantiate: open substitution");
@@ -662,7 +729,7 @@ impl Store {
     }
 
     fn inst_rec(&mut self, t: TermId, off: u32, xs: &[TermId]) -> TermId {
-        if self.meta[t as usize].lbr <= off {
+        if self.nodes[t as usize].lbr <= off {
             return t;
         }
         let n = self.nodes[t as usize];
@@ -716,16 +783,40 @@ impl Store {
         if let Some(r) = self.inst_memo.get(key) {
             return r;
         }
-        let mut spine = Vec::new();
-        let base = self.collect_spine(t, &mut spine, |m| m.lbr > off);
+        let base_len = self.spine.len();
+        let base = self.push_spine(t, |m| m.lbr > off);
         let mut r = self.inst_rec(base, off, xs);
-        for &node in spine.iter().rev() {
+        let mut i = self.spine.len();
+        while i > base_len {
+            i -= 1;
+            let node = self.spine[i];
             let arg = self.nodes[node as usize].b;
             let ai = self.inst_rec(arg, off, xs);
             r = self.mk_app(r, ai);
-            self.inst_memo.put(memo_key(node, off), r);
+            if i == base_len {
+                self.inst_memo.put(memo_key(node, off), r);
+            }
         }
+        self.spine.truncate(base_len);
         r
+    }
+
+    /// Walks the application spine starting at `t` (an App) while the function position is an
+    /// App satisfying `keep`. Pushes every visited spine node onto `self.spine` (outermost
+    /// first) and returns the first function-position term that is not collected. Callers
+    /// pop back to their own base length, which keeps nested use of the stack correct.
+    #[inline]
+    fn push_spine(&mut self, t: TermId, keep: impl Fn(&Entry) -> bool) -> TermId {
+        let mut cur = t;
+        loop {
+            self.spine.push(cur);
+            let f = self.nodes[cur as usize].a;
+            if self.nodes[f as usize].tag == T_APP && keep(&self.nodes[f as usize]) {
+                cur = f;
+            } else {
+                return f;
+            }
+        }
     }
 
     // ----- abstract_locals -------------------------------------------------------
@@ -733,7 +824,7 @@ impl Store {
     /// Inverse of instantiation: `locals[j]` becomes `BVar(locals.len()-1-j + binder depth)`.
     /// The locals must be distinct `Local` terms.
     pub fn abstract_locals(&mut self, t: TermId, locals: &[TermId]) -> TermId {
-        if locals.is_empty() || self.meta[t as usize].local_ub == 0 {
+        if locals.is_empty() || self.nodes[t as usize].local_ub == 0 {
             return t;
         }
         let mut min_depth = u32::MAX;
@@ -757,7 +848,7 @@ impl Store {
     }
 
     fn abs_rec(&mut self, t: TermId, off: u32, ctx: &AbsCtx) -> TermId {
-        if self.meta[t as usize].local_ub <= ctx.min_depth {
+        if self.nodes[t as usize].local_ub <= ctx.min_depth {
             return t;
         }
         let n = self.nodes[t as usize];
@@ -807,15 +898,21 @@ impl Store {
             return r;
         }
         let min = ctx.min_depth;
-        let mut spine = Vec::new();
-        let base = self.collect_spine(t, &mut spine, |m| m.local_ub > min);
+        let base_len = self.spine.len();
+        let base = self.push_spine(t, |m| m.local_ub > min);
         let mut r = self.abs_rec(base, off, ctx);
-        for &node in spine.iter().rev() {
+        let mut i = self.spine.len();
+        while i > base_len {
+            i -= 1;
+            let node = self.spine[i];
             let arg = self.nodes[node as usize].b;
             let ai = self.abs_rec(arg, off, ctx);
             r = self.mk_app(r, ai);
-            self.abs_memo.put(memo_key(node, off), r);
+            if i == base_len {
+                self.abs_memo.put(memo_key(node, off), r);
+            }
         }
+        self.spine.truncate(base_len);
         r
     }
 
@@ -829,7 +926,7 @@ impl Store {
             self.list_len[levels as usize] as usize,
             "subst_params: parameter/level count mismatch"
         );
-        if params.is_empty() || !self.meta[t as usize].has_param {
+        if params.is_empty() || !self.nodes[t as usize].has_param {
             return t;
         }
         let ls: Vec<LevelId> = self.levels(levels).to_vec();
@@ -838,10 +935,11 @@ impl Store {
     }
 
     fn subst_rec(&mut self, t: TermId, params: &[NameId], ls: &[LevelId]) -> TermId {
-        if !self.meta[t as usize].has_param {
+        if !self.nodes[t as usize].has_param {
             return t;
         }
-        if let Some(r) = self.subst_memo.get(t) {
+        let key = t as u64;
+        if let Some(r) = self.subst_memo.get(key) {
             return r;
         }
         let n = self.nodes[t as usize];
@@ -888,20 +986,26 @@ impl Store {
             }
             _ => t,
         };
-        self.subst_memo.put(t, r);
+        self.subst_memo.put(key, r);
         r
     }
 
     fn subst_app(&mut self, t: TermId, params: &[NameId], ls: &[LevelId]) -> TermId {
-        let mut spine = Vec::new();
-        let base = self.collect_spine(t, &mut spine, |m| m.has_param);
+        let base_len = self.spine.len();
+        let base = self.push_spine(t, |m| m.has_param);
         let mut r = self.subst_rec(base, params, ls);
-        for &node in spine.iter().rev() {
+        let mut i = self.spine.len();
+        while i > base_len {
+            i -= 1;
+            let node = self.spine[i];
             let arg = self.nodes[node as usize].b;
             let ai = self.subst_rec(arg, params, ls);
             r = self.mk_app(r, ai);
-            self.subst_memo.put(node, r);
+            if i == base_len {
+                self.subst_memo.put(node as u64, r);
+            }
         }
+        self.spine.truncate(base_len);
         r
     }
 
