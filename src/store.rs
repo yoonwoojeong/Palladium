@@ -186,7 +186,7 @@ impl Table {
     #[inline]
     pub(crate) fn insert_at(&mut self, slot: usize, id: u32, h: u32) {
         let packed = ((h as u64) << 32) | id as u64;
-        if (self.len + 1) * 2 > self.slots.len() {
+        if (self.len + 1) * 4 > self.slots.len() * 3 {
             let new_cap = self.slots.len() * 2;
             let old = std::mem::replace(&mut self.slots, vec![0; new_cap]);
             for s in old.into_iter().filter(|&x| x != 0) {
