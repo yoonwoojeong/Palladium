@@ -121,6 +121,8 @@ fn worker(env: &Env, counter: &AtomicUsize, fault: &Mutex<Option<String>>, total
     let trace = std::env::var_os("PALLADIUM_TRACE").is_some();
     let stats_on = std::env::var_os("PALLADIUM_STATS").is_some();
     let only_pos: Option<usize> = std::env::var("PALLADIUM_ONLY_POS").ok().and_then(|v| v.parse().ok());
+    // Diagnostics: `PALLADIUM_RESET_TERMS=<n>` overrides the store size that triggers a reset.
+    let reset_terms: usize = std::env::var("PALLADIUM_RESET_TERMS").ok().and_then(|v| v.parse().ok()).unwrap_or(RESET_TERMS);
     let t_loop = std::time::Instant::now();
     let u0 = thread_usage();
     let mut ws = WStats::default();
@@ -135,7 +137,7 @@ fn worker(env: &Env, counter: &AtomicUsize, fault: &Mutex<Option<String>>, total
         if only_pos.map_or(false, |o| o != p) {
             continue;
         }
-        if checker.store.num_terms() > RESET_TERMS {
+        if checker.store.num_terms() > reset_terms {
             let tr = std::time::Instant::now();
             ws.resets_terms += checker.store.num_terms() as u64;
             checker.reset();
@@ -209,11 +211,20 @@ fn worker(env: &Env, counter: &AtomicUsize, fault: &Mutex<Option<String>>, total
 
 /// Peak resident set size (VmHWM) in KiB, or 0 when unavailable.
 fn peak_rss_kib() -> u64 {
+    rss_field("VmHWM:")
+}
+
+/// Current resident set size (VmRSS) in KiB, or 0 when unavailable.
+fn current_rss_kib() -> u64 {
+    rss_field("VmRSS:")
+}
+
+fn rss_field(key: &str) -> u64 {
     std::fs::read_to_string("/proc/self/status")
         .ok()
         .and_then(|s| {
             s.lines()
-                .find_map(|l| l.strip_prefix("VmHWM:"))
+                .find_map(|l| l.strip_prefix(key))
                 .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
         })
         .unwrap_or(0)
@@ -271,7 +282,7 @@ fn main() {
     // The file bytes are not needed past this point.
     drop(bytes);
     if trace {
-        eprintln!("trace: peak RSS after load {}", peak_rss_kib());
+        eprintln!("trace: peak RSS after load {} KiB, current RSS {} KiB", peak_rss_kib(), current_rss_kib());
     }
     if opts.parse_only {
         if !opts.quiet {
