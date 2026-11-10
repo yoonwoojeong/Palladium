@@ -42,8 +42,7 @@ impl Store {
                 let id = self.lnodes.len() as u32;
                 self.lnodes.push(n);
                 self.lmeta.push(meta);
-                let lnodes = &self.lnodes;
-                self.level_tab.insert_at(slot, id, hash_lnode(&n), |i| hash_lnode(&lnodes[i as usize]));
+                self.level_tab.insert_at(slot, id, hash_lnode(&n));
                 id
             }
         }
