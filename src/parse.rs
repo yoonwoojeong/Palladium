@@ -1270,9 +1270,6 @@ mod tests {
         }
     }
 
-    /// Placeholder bignum limit: good files with nat literals above u64 cannot load until the real bignum lands.
-    const PENDING_BIGNUM: &[&str] = &["init-prelude.ndjson"];
-
     #[test]
     fn arena_corpus() {
         let root = Path::new("/home/user/Palladium/arena-tests");
@@ -1287,11 +1284,6 @@ mod tests {
         for f in &good {
             let bytes = fs::read(f).expect("read");
             if let Err(e) = load(&bytes) {
-                let fname = f.file_name().unwrap().to_string_lossy().to_string();
-                if PENDING_BIGNUM.contains(&fname.as_str()) && e.to_string().contains("natVal") {
-                    println!("note: {} needs the real bignum: {e}", f.display());
-                    continue;
-                }
                 failures.push(format!("{}: {e}", f.display()));
             }
         }
