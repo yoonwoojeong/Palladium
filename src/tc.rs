@@ -5,7 +5,7 @@
 use crate::bignat::BigNat;
 use crate::env::{ConstInfo, ConstKind, CtorInfo, Decl, Env, Hints, InductInfo, NameId, RawExpr, RawLevel, RawLevelNode, RawTag, RecInfo, Safety};
 use crate::store::{Level, LevelId, LevelsId, Store, Term, TermId};
-use crate::util::{FxHashMap, FxHashSet};
+use crate::util::{DenseMap, FxHashMap, FxHashSet};
 
 #[derive(Debug)]
 pub enum Fail {
@@ -85,10 +85,12 @@ pub struct Checker<'e> {
     depth: u32,
     imp_expr: Vec<TermId>,
     imp_level: Vec<LevelId>,
-    infer_chk: FxHashMap<TermId, TermId>,
-    infer_only: FxHashMap<TermId, TermId>,
-    whnf_core_c: FxHashMap<TermId, TermId>,
-    whnf_c: FxHashMap<TermId, TermId>,
+    /// Reusable argument buffers (see `take_buf` / `give_buf`).
+    buf_pool: Vec<Vec<TermId>>,
+    infer_chk: DenseMap,
+    infer_only: DenseMap,
+    whnf_core_c: DenseMap,
+    whnf_c: DenseMap,
     const_ty: FxHashMap<(NameId, LevelsId), TermId>,
     unfold_c: FxHashMap<(NameId, LevelsId), TermId>,
     rule_c: FxHashMap<(NameId, LevelsId, u32), TermId>,
@@ -110,10 +112,11 @@ impl<'e> Checker<'e> {
             depth: 0,
             imp_expr: Vec::new(),
             imp_level: Vec::new(),
-            infer_chk: FxHashMap::default(),
-            infer_only: FxHashMap::default(),
-            whnf_core_c: FxHashMap::default(),
-            whnf_c: FxHashMap::default(),
+            buf_pool: Vec::new(),
+            infer_chk: DenseMap::default(),
+            infer_only: DenseMap::default(),
+            whnf_core_c: DenseMap::default(),
+            whnf_c: DenseMap::default(),
             const_ty: FxHashMap::default(),
             unfold_c: FxHashMap::default(),
             rule_c: FxHashMap::default(),
@@ -123,6 +126,21 @@ impl<'e> Checker<'e> {
         };
         c.reset();
         c
+    }
+
+    /// An empty argument buffer, reusing a previously returned allocation.
+    #[inline]
+    fn take_buf(&mut self) -> Vec<TermId> {
+        self.buf_pool.pop().unwrap_or_default()
+    }
+
+    /// Returns an argument buffer to the pool.
+    #[inline]
+    fn give_buf(&mut self, mut v: Vec<TermId>) {
+        if self.buf_pool.len() < 32 {
+            v.clear();
+            self.buf_pool.push(v);
+        }
     }
 
     /// Clears the store, the import tables and all caches.
@@ -429,11 +447,11 @@ impl<'e> Checker<'e> {
         if self.store.lbr(t) > 0 {
             return reject("type checker does not support loose bound variables");
         }
-        if let Some(&r) = self.infer_chk.get(&t) {
+        if let Some(r) = self.infer_chk.get(t) {
             return Ok(r);
         }
         if !check {
-            if let Some(&r) = self.infer_only.get(&t) {
+            if let Some(r) = self.infer_only.get(t) {
                 return Ok(r);
             }
         }
@@ -688,7 +706,7 @@ impl<'e> Checker<'e> {
         }
         let cacheable = !cheap_rec && !cheap_proj;
         if cacheable {
-            if let Some(&r) = self.whnf_core_c.get(&t) {
+            if let Some(r) = self.whnf_core_c.get(t) {
                 return Ok(r);
             }
         }
@@ -702,19 +720,22 @@ impl<'e> Checker<'e> {
                 None => t,
             },
             Term::App(..) => {
-                let mut args = Vec::new();
+                let mut args = self.take_buf();
                 let f0 = self.store.unfold_app(t, &mut args);
                 let f = self.whnf_core(f0, cheap_rec, cheap_proj)?;
                 if let Term::Lam(..) = self.store.get(f) {
                     let r = self.store.beta(f, &args);
+                    self.give_buf(args);
                     self.whnf_core(r, cheap_rec, cheap_proj)?
                 } else if f == f0 {
+                    self.give_buf(args);
                     match self.reduce_recursor(t, cheap_rec, cheap_proj)? {
                         Some(r) => self.whnf_core(r, cheap_rec, cheap_proj)?,
                         None => t,
                     }
                 } else {
                     let r = self.store.mk_app_n(f, &args);
+                    self.give_buf(args);
                     self.whnf_core(r, cheap_rec, cheap_proj)?
                 }
             }
@@ -863,9 +884,24 @@ impl<'e> Checker<'e> {
 
     /// `inductive_reduce_rec` of inductive.h.
     fn inductive_reduce_rec(&mut self, e: TermId, cheap_rec: bool, cheap_proj: bool) -> R<Option<TermId>> {
+        let mut rargs = self.take_buf();
+        let mut margs = self.take_buf();
+        let r = self.inductive_reduce_rec_core(e, cheap_rec, cheap_proj, &mut rargs, &mut margs);
+        self.give_buf(rargs);
+        self.give_buf(margs);
+        r
+    }
+
+    fn inductive_reduce_rec_core(
+        &mut self,
+        e: TermId,
+        cheap_rec: bool,
+        cheap_proj: bool,
+        rargs: &mut Vec<TermId>,
+        margs: &mut Vec<TermId>,
+    ) -> R<Option<TermId>> {
         self.stats[4] += 1;
-        let mut rargs = Vec::new();
-        let fnc = self.store.unfold_app(e, &mut rargs);
+        let fnc = self.store.unfold_app(e, rargs);
         let Term::Const(rn, rls) = self.store.get(fnc) else { return Ok(None) };
         let Some(info) = self.const_info_opt(rn) else { return Ok(None) };
         let ConstKind::Rec(rec) = &info.kind else { return Ok(None) };
@@ -892,8 +928,7 @@ impl<'e> Checker<'e> {
             }
             _ => major = self.to_cnstr_when_structure(rec, rn, major, cheap_rec, cheap_proj)?,
         }
-        let mut margs = Vec::new();
-        let mhead = self.store.unfold_app(major, &mut margs);
+        let mhead = self.store.unfold_app(major, margs);
         let Term::Const(mcn, _) = self.store.get(mhead) else { return Ok(None) };
         let Some((rule_idx, rule)) = rec.rules.iter().enumerate().find(|(_, r)| r.ctor == mcn) else { return Ok(None) };
         let rule_idx = rule_idx as u32;
@@ -1204,7 +1239,7 @@ impl<'e> Checker<'e> {
             Term::BVar(_) | Term::Sort(_) | Term::Pi(..) | Term::Nat(_) | Term::Str(_) | Term::Local(_) => return Ok(t),
             _ => {}
         }
-        if let Some(&r) = self.whnf_c.get(&t) {
+        if let Some(r) = self.whnf_c.get(t) {
             return Ok(r);
         }
         let mut cur = t;

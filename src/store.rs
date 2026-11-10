@@ -80,6 +80,25 @@ pub(crate) struct Meta {
 
 const META_LEAF: Meta = Meta { lbr: 0, local_ub: 0, has_param: false };
 
+/// A stored term: its node and its metadata in one record (one cache line per visit).
+#[derive(Clone, Copy)]
+pub(crate) struct Entry {
+    pub(crate) tag: u8,
+    pub(crate) has_param: bool,
+    pub(crate) lbr: u32,
+    pub(crate) local_ub: u32,
+    pub(crate) a: u32,
+    pub(crate) b: u32,
+    pub(crate) c: u32,
+}
+
+impl Entry {
+    #[inline]
+    fn same_node(&self, n: &Node) -> bool {
+        self.tag == n.tag && self.a == n.a && self.b == n.b && self.c == n.c
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LNode {
     pub(crate) tag: u8,
@@ -308,8 +327,7 @@ impl<'a> AbsCtx<'a> {
 /// Hash-consed store of terms, universe levels, universe-level lists, locals and nat
 /// literals. Every node carries its metadata (`lbr`, `local_ub`, `has_param`).
 pub struct Store {
-    pub(crate) nodes: Vec<Node>,
-    pub(crate) meta: Vec<Meta>,
+    pub(crate) nodes: Vec<Entry>,
     pub(crate) term_tab: Table,
     pub(crate) lnodes: Vec<LNode>,
     pub(crate) lmeta: Vec<LMeta>,
@@ -342,7 +360,6 @@ impl Store {
     pub fn new() -> Store {
         let mut s = Store {
             nodes: Vec::new(),
-            meta: Vec::new(),
             term_tab: Table::new(),
             lnodes: Vec::new(),
             lmeta: Vec::new(),
@@ -370,9 +387,7 @@ impl Store {
     /// Drops every node, keeping allocations.
     pub fn clear(&mut self) {
         self.nodes.clear();
-        self.nodes.push(Node { tag: T_DUMMY, a: 0, b: 0, c: 0 });
-        self.meta.clear();
-        self.meta.push(META_LEAF);
+        self.nodes.push(Entry { tag: T_DUMMY, has_param: false, lbr: 0, local_ub: 0, a: 0, b: 0, c: 0 });
         self.term_tab.clear();
         self.lnodes.clear();
         self.lnodes.push(LNode { tag: L_DUMMY, a: 0, b: 0 });
@@ -430,28 +445,28 @@ impl Store {
     /// Loose bound variable range: 0 means closed.
     #[inline]
     pub fn lbr(&self, t: TermId) -> u32 {
-        self.meta[t as usize].lbr
+        self.nodes[t as usize].lbr
     }
 
     /// 0 if the term contains no locals, else 1 + the largest local depth occurring in it.
     #[inline]
     pub fn local_ub(&self, t: TermId) -> u32 {
-        self.meta[t as usize].local_ub
+        self.nodes[t as usize].local_ub
     }
 
     #[inline]
     pub fn has_param(&self, t: TermId) -> bool {
-        self.meta[t as usize].has_param
+        self.nodes[t as usize].has_param
     }
 
     #[inline]
     pub fn is_closed(&self, t: TermId) -> bool {
-        self.meta[t as usize].lbr == 0
+        self.nodes[t as usize].lbr == 0
     }
 
     #[inline]
     pub fn has_loose_bvars(&self, t: TermId) -> bool {
-        self.meta[t as usize].lbr > 0
+        self.nodes[t as usize].lbr > 0
     }
 
     pub fn nat_value(&self, id: NatId) -> &BigNat {
@@ -478,12 +493,19 @@ impl Store {
 
     #[inline]
     fn intern_term(&mut self, n: Node, m: Meta) -> TermId {
-        match self.term_tab.find(hash_node(&n), |id| self.nodes[id as usize] == n) {
+        match self.term_tab.find(hash_node(&n), |id| self.nodes[id as usize].same_node(&n)) {
             Ok(id) => id,
             Err(slot) => {
                 let id = self.nodes.len() as u32;
-                self.nodes.push(n);
-                self.meta.push(m);
+                self.nodes.push(Entry {
+                    tag: n.tag,
+                    has_param: m.has_param,
+                    lbr: m.lbr,
+                    local_ub: m.local_ub,
+                    a: n.a,
+                    b: n.b,
+                    c: n.c,
+                });
                 self.term_tab.insert_at(slot, id, hash_node(&n));
                 id
             }
@@ -518,8 +540,8 @@ impl Store {
 
     #[inline]
     pub fn mk_app(&mut self, f: TermId, a: TermId) -> TermId {
-        let mf = self.meta[f as usize];
-        let ma = self.meta[a as usize];
+        let mf = self.nodes[f as usize];
+        let ma = self.nodes[a as usize];
         let m = Meta {
             lbr: mf.lbr.max(ma.lbr),
             local_ub: mf.local_ub.max(ma.local_ub),
@@ -542,8 +564,8 @@ impl Store {
 
     #[inline]
     fn binder_meta(&self, ty: TermId, body: TermId) -> Meta {
-        let mt = self.meta[ty as usize];
-        let mb = self.meta[body as usize];
+        let mt = self.nodes[ty as usize];
+        let mb = self.nodes[body as usize];
         Meta {
             lbr: mt.lbr.max(mb.lbr.saturating_sub(1)),
             local_ub: mt.local_ub.max(mb.local_ub),
@@ -552,9 +574,9 @@ impl Store {
     }
 
     pub fn mk_let(&mut self, ty: TermId, val: TermId, body: TermId) -> TermId {
-        let mt = self.meta[ty as usize];
-        let mv = self.meta[val as usize];
-        let mb = self.meta[body as usize];
+        let mt = self.nodes[ty as usize];
+        let mv = self.nodes[val as usize];
+        let mb = self.nodes[body as usize];
         let m = Meta {
             lbr: mt.lbr.max(mv.lbr).max(mb.lbr.saturating_sub(1)),
             local_ub: mt.local_ub.max(mv.local_ub).max(mb.local_ub),
@@ -564,7 +586,7 @@ impl Store {
     }
 
     pub fn mk_proj(&mut self, name: NameId, idx: u32, e: TermId) -> TermId {
-        let me = self.meta[e as usize];
+        let me = Meta { lbr: self.nodes[e as usize].lbr, local_ub: self.nodes[e as usize].local_ub, has_param: self.nodes[e as usize].has_param };
         self.intern_term(Node { tag: T_PROJ, a: name, b: idx, c: e }, me)
     }
 
@@ -613,7 +635,7 @@ impl Store {
                 id
             }
         };
-        let hp = self.meta[ty as usize].has_param;
+        let hp = self.nodes[ty as usize].has_param;
         self.intern_term(
             Node { tag: T_LOCAL, a: lid, b: 0, c: 0 },
             Meta { lbr: 0, local_ub: depth.saturating_add(1), has_param: hp },
@@ -698,7 +720,7 @@ impl Store {
     /// Loose bvar `i` becomes `xs[xs.len()-1-i]` if `i < xs.len()`, else `BVar(i - xs.len())`.
     /// All `xs` must be closed.
     pub fn instantiate(&mut self, t: TermId, xs: &[TermId]) -> TermId {
-        if xs.is_empty() || self.meta[t as usize].lbr == 0 {
+        if xs.is_empty() || self.nodes[t as usize].lbr == 0 {
             return t;
         }
         debug_assert!(xs.iter().all(|&x| self.is_closed(x)), "instantiate: open substitution");
@@ -707,7 +729,7 @@ impl Store {
     }
 
     fn inst_rec(&mut self, t: TermId, off: u32, xs: &[TermId]) -> TermId {
-        if self.meta[t as usize].lbr <= off {
+        if self.nodes[t as usize].lbr <= off {
             return t;
         }
         let n = self.nodes[t as usize];
@@ -782,12 +804,12 @@ impl Store {
     /// first) and returns the first function-position term that is not collected. Callers
     /// pop back to their own base length, which keeps nested use of the stack correct.
     #[inline]
-    fn push_spine(&mut self, t: TermId, keep: impl Fn(&Meta) -> bool) -> TermId {
+    fn push_spine(&mut self, t: TermId, keep: impl Fn(&Entry) -> bool) -> TermId {
         let mut cur = t;
         loop {
             self.spine.push(cur);
             let f = self.nodes[cur as usize].a;
-            if self.nodes[f as usize].tag == T_APP && keep(&self.meta[f as usize]) {
+            if self.nodes[f as usize].tag == T_APP && keep(&self.nodes[f as usize]) {
                 cur = f;
             } else {
                 return f;
@@ -800,7 +822,7 @@ impl Store {
     /// Inverse of instantiation: `locals[j]` becomes `BVar(locals.len()-1-j + binder depth)`.
     /// The locals must be distinct `Local` terms.
     pub fn abstract_locals(&mut self, t: TermId, locals: &[TermId]) -> TermId {
-        if locals.is_empty() || self.meta[t as usize].local_ub == 0 {
+        if locals.is_empty() || self.nodes[t as usize].local_ub == 0 {
             return t;
         }
         let mut min_depth = u32::MAX;
@@ -824,7 +846,7 @@ impl Store {
     }
 
     fn abs_rec(&mut self, t: TermId, off: u32, ctx: &AbsCtx) -> TermId {
-        if self.meta[t as usize].local_ub <= ctx.min_depth {
+        if self.nodes[t as usize].local_ub <= ctx.min_depth {
             return t;
         }
         let n = self.nodes[t as usize];
@@ -900,7 +922,7 @@ impl Store {
             self.list_len[levels as usize] as usize,
             "subst_params: parameter/level count mismatch"
         );
-        if params.is_empty() || !self.meta[t as usize].has_param {
+        if params.is_empty() || !self.nodes[t as usize].has_param {
             return t;
         }
         let ls: Vec<LevelId> = self.levels(levels).to_vec();
@@ -909,7 +931,7 @@ impl Store {
     }
 
     fn subst_rec(&mut self, t: TermId, params: &[NameId], ls: &[LevelId]) -> TermId {
-        if !self.meta[t as usize].has_param {
+        if !self.nodes[t as usize].has_param {
             return t;
         }
         let key = t as u64;
