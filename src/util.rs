@@ -61,18 +61,21 @@ pub type FxBuild = BuildHasherDefault<FxHasher>;
 pub type FxHashMap<K, V> = std::collections::HashMap<K, V, FxBuild>;
 pub type FxHashSet<K> = std::collections::HashSet<K, FxBuild>;
 
-/// Map from dense ids (all >= 1, as `TermId`s are) to ids. `0` means absent, so a lookup is
-/// one bounds check and one load. `clear` is O(1) and keeps the allocation.
+/// Map from dense ids (all >= 1, as `TermId`s are) to ids. Each slot stores its generation
+/// with the value, and a slot is live only when its generation is the current one, so `clear`
+/// is O(1) and keeps the allocation: clearing must not zero the (possibly multi-million entry)
+/// table, and growing after a clear must not re-zero the prefix.
 #[derive(Default)]
 pub struct DenseMap {
-    v: Vec<u32>,
+    v: Vec<(u32, u32)>,
+    gen: u32,
 }
 
 impl DenseMap {
     #[inline]
     pub fn get(&self, k: u32) -> Option<u32> {
         match self.v.get(k as usize) {
-            Some(&x) if x != 0 => Some(x),
+            Some(&(g, x)) if g == self.gen && x != 0 => Some(x),
             _ => None,
         }
     }
@@ -82,13 +85,17 @@ impl DenseMap {
         let i = k as usize;
         if i >= self.v.len() {
             let n = (i + 1).max(self.v.len() * 2);
-            self.v.resize(n, 0);
+            self.v.resize(n, (0, 0));
         }
-        self.v[i] = val;
+        self.v[i] = (self.gen, val);
     }
 
     pub fn clear(&mut self) {
-        self.v.clear();
+        self.gen = self.gen.wrapping_add(1);
+        if self.gen == 0 {
+            self.v.fill((0, 0));
+            self.gen = 1;
+        }
     }
 }
 

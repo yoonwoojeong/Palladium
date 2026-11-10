@@ -244,10 +244,9 @@ impl Memo {
             self.gen = 1;
         }
     }
+    /// Drops every entry in O(1) (a generation bump; the table is zeroed only on wrap-around).
     fn clear(&mut self) {
-        self.ents.fill(MemoEnt::default());
-        self.gen = 0;
-        self.live = 0;
+        self.begin();
     }
     #[inline]
     fn slot(key: u64, mask: usize) -> usize {

@@ -15,7 +15,7 @@ use palladium::tc::{Checker, Fail};
 
 const STACK_SIZES: [usize; 3] = [4 << 30, 1 << 30, 256 << 20];
 /// A worker recreates its store between declarations once it holds more terms than this.
-const RESET_TERMS: usize = 3_000_000;
+const RESET_TERMS: usize = 250_000;
 
 struct Opts {
     jobs: Option<usize>,
