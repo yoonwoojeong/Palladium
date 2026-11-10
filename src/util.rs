@@ -99,6 +99,92 @@ impl DenseMap {
     }
 }
 
+/// Hashed map `u32 -> u32` with O(1) logical clear and memory proportional to the number of
+/// live entries (not to the key range). Used for the import memo, whose keys range over the
+/// whole file (tens of millions of expressions) while one checking run touches a few thousand
+/// per declaration: a dense table would be re-zeroed on every reset.
+/// Slots are `(key, generation, value)`; a slot is occupied only when its generation is current.
+pub struct GenMap {
+    slots: Vec<(u32, u32, u32)>,
+    gen: u32,
+    len: usize,
+}
+
+impl Default for GenMap {
+    fn default() -> Self {
+        GenMap { slots: vec![(0, 0, 0); 1 << 12], gen: 1, len: 0 }
+    }
+}
+
+impl GenMap {
+    #[inline]
+    fn start(key: u32, mask: usize) -> usize {
+        ((key as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize & mask
+    }
+
+    #[inline]
+    pub fn get(&self, key: u32) -> Option<u32> {
+        let mask = self.slots.len() - 1;
+        let mut i = Self::start(key, mask);
+        loop {
+            let (k, g, v) = self.slots[i];
+            if g != self.gen {
+                return None;
+            }
+            if k == key {
+                return Some(v);
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    #[inline]
+    pub fn insert(&mut self, key: u32, val: u32) {
+        if (self.len + 1) * 2 > self.slots.len() {
+            let old = std::mem::replace(&mut self.slots, vec![(0, 0, 0); 0]);
+            let cap = old.len() * 2;
+            self.slots = vec![(0, 0, 0); cap];
+            let gen = self.gen;
+            let mask = cap - 1;
+            for (k, g, v) in old {
+                if g == gen {
+                    let mut i = Self::start(k, mask);
+                    while self.slots[i].1 == gen {
+                        i = (i + 1) & mask;
+                    }
+                    self.slots[i] = (k, gen, v);
+                }
+            }
+        }
+        let mask = self.slots.len() - 1;
+        let gen = self.gen;
+        let mut i = Self::start(key, mask);
+        loop {
+            let (k, g, _) = self.slots[i];
+            if g != gen {
+                self.slots[i] = (key, gen, val);
+                self.len += 1;
+                return;
+            }
+            if k == key {
+                self.slots[i] = (key, gen, val);
+                return;
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    /// Drops every entry in O(1); the table is zeroed only when the generation wraps.
+    pub fn clear(&mut self) {
+        self.len = 0;
+        self.gen = self.gen.wrapping_add(1);
+        if self.gen == 0 {
+            self.slots.fill((0, 0, 0));
+            self.gen = 1;
+        }
+    }
+}
+
 /// A good 64-bit mixing function of two words (used for hash-consing).
 #[inline]
 pub fn mix(a: u64, b: u64) -> u64 {
