@@ -243,6 +243,11 @@ fn main() {
     if trace {
         eprintln!("trace: check {:.3}s, peak RSS {} KiB", t_check.elapsed().as_secs_f64(), peak_rss_kib());
     }
+    // A partial (diagnostic) run must never be reported as an acceptance of the file.
+    if std::env::var_os("PALLADIUM_ONLY_POS").is_some() {
+        eprintln!("PALLADIUM_ONLY_POS set: only one declaration was checked; declining");
+        process::exit(2);
+    }
     if !opts.quiet {
         println!("ok: {total} declarations");
     }
