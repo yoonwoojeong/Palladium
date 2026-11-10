@@ -77,7 +77,6 @@ struct UData {
 
 /// A derived recursor, to be compared with the file's.
 struct DerivedRec {
-    name: NameId,
     lparams: Vec<NameId>,
     ty: TermId,
     nidx: usize,
@@ -85,14 +84,10 @@ struct DerivedRec {
 }
 
 struct Blk {
-    lparams: Vec<NameId>,
     lvl_ids: Vec<LevelId>,
     levels: LevelsId,
     np: usize,
-    /// Number of types of the original block (the first `norig` entries of `tys`).
-    norig: usize,
     orig_names: Vec<NameId>,
-    orig_ctor_names: Vec<Vec<NameId>>,
     tys: Vec<TyD>,
     params: Vec<TermId>,
     ind_cnst: Vec<TermId>,
@@ -228,11 +223,6 @@ impl Blk {
         false
     }
 
-    /// Does `t` mention a constant whose name is in `names` (only block names matter here)?
-    fn mentions_block(&self, tc: &Checker, t: TermId) -> bool {
-        self.has_ind_occ(tc, t)
-    }
-
     /// `t` is `I As is` for the block type `I` at index `i` (rule `is_valid_ind_app`).
     fn is_valid_ind_app(&self, tc: &Checker, t: TermId, i: usize) -> bool {
         let (head, args) = spine(tc, t);
@@ -337,11 +327,11 @@ impl Blk {
                 tc.store.mk_app_n(h, &nargs)
             }
             Some((Restore::Ind(key), _)) => {
-                self.check_params_prefix(tc, &args)?;
+                self.check_params_prefix(&args)?;
                 tc.store.mk_app_n(key, &args[self.np..])
             }
             Some((Restore::Ctor(key, real), _)) => {
-                self.check_params_prefix(tc, &args)?;
+                self.check_params_prefix(&args)?;
                 let mut kargs = Vec::new();
                 let kh = tc.store.unfold_app(key, &mut kargs);
                 let Term::Const(_, klv) = tc.store.get(kh) else {
@@ -390,11 +380,10 @@ impl Blk {
         Ok(r)
     }
 
-    fn check_params_prefix(&self, tc: &Checker, args: &[TermId]) -> R<()> {
+    fn check_params_prefix(&self, args: &[TermId]) -> R<()> {
         if args.len() < self.np || args[..self.np] != self.params[..] {
             return reject("failed to restore nested inductive types: auxiliary type not applied to the parameters");
         }
-        let _ = tc;
         Ok(())
     }
 
@@ -436,7 +425,7 @@ impl Blk {
             if tc.store.lbr(a) > 0 {
                 loose = true;
             }
-            if self.mentions_block(tc, a) {
+            if self.has_ind_occ(tc, a) {
                 nested = true;
             }
         }
@@ -469,7 +458,7 @@ impl Blk {
             self.restore.insert(aux, Restore::Ind(jas));
             // Type of the auxiliary type: the type of `J` at the arguments `Ds`.
             let jci = tc.const_info(j_name)?;
-            let jty = self.inst_const_type(tc, jci, i_lvls, &args[..inp])?;
+            let jty = self.inst_const_type(tc, jci, i_lvls)?;
             let (aux_ty, _) = strip_params_pi(tc, jty, inp)?;
             let aux_ty = tc.store.instantiate(aux_ty, &args[..inp]);
             let mut cts = Vec::new();
@@ -478,7 +467,7 @@ impl Blk {
                 if !matches!(cci.kind, ConstKind::Ctor(_)) {
                     return reject("nested inductive constructor list is not a constructor");
                 }
-                let cty = self.inst_const_type(tc, cci, i_lvls, &args[..inp])?;
+                let cty = self.inst_const_type(tc, cci, i_lvls)?;
                 let (pre, nfields) = strip_params_pi(tc, cty, inp)?;
                 let pre = tc.store.instantiate(pre, &args[..inp]);
                 let fake_c = self.fake();
@@ -501,7 +490,7 @@ impl Blk {
     /// The type of constant `ci` with its universe parameters set to `lv`, with the first
     /// `args.len()` binders stripped (syntactically) and instantiated with `args`. Used for the
     /// types of nested occurrences.
-    fn inst_const_type(&self, tc: &mut Checker, ci: &crate::env::ConstInfo, lv: LevelsId, _args: &[TermId]) -> R<TermId> {
+    fn inst_const_type(&self, tc: &mut Checker, ci: &crate::env::ConstInfo, lv: LevelsId) -> R<TermId> {
         if tc.store.levels(lv).len() != ci.level_params.len() {
             return reject("nested occurrence has the wrong number of universe levels");
         }
@@ -730,13 +719,10 @@ fn check_safe_block(tc: &mut Checker, pos: u32, types: &[NameId], ctors: &[NameI
     }
 
     let mut blk = Blk {
-        lparams: lparams.clone(),
         lvl_ids: lvl_ids.clone(),
         levels,
         np,
-        norig: n,
         orig_names: types.to_vec(),
-        orig_ctor_names: orig_ctor_names.clone(),
         tys: Vec::new(),
         params: Vec::new(),
         ind_cnst: Vec::new(),
@@ -812,6 +798,15 @@ fn check_safe_block(tc: &mut Checker, pos: u32, types: &[NameId], ctors: &[NameI
 
     // Phase B: the nested elimination (elim_nested_inductive_fn), on the original constructors.
     let nested_id = env.raw.find_name(&["_nested"]);
+    if let Some(nid) = nested_id {
+        for &t in types {
+            let Some(ci) = env.get(t) else { return reject("missing inductive type") };
+            let ty = tc.import_expr(ci.ty);
+            if mentions_reserved(tc, ty, nid) {
+                return reject("declaration uses the reserved prefix of auxiliary declarations");
+            }
+        }
+    }
     for d in 0..n {
         for c in &blk.tys[d].ctors {
             if let (Some(full), Some(nid)) = (c.full, nested_id) {
@@ -903,7 +898,6 @@ fn check_safe_block(tc: &mut Checker, pos: u32, types: &[NameId], ctors: &[NameI
                 t = tc.store.instantiate(body, &[x]);
             }
             if !blk.is_valid_ind_app(tc, t, d) {
-                if std::env::var("IND_DEBUG").is_ok() { eprintln!("DBG res={} final={} d={} nidx={} params={:?} ind={}", tc.show(res), tc.show(t), d, blk.tys[d].nidx, blk.params.iter().map(|&p| tc.show(p)).collect::<Vec<_>>(), tc.show(blk.ind_cnst[d])); }
                 return reject("invalid return type of a constructor");
             }
         }
@@ -1143,7 +1137,7 @@ fn check_safe_block(tc: &mut Checker, pos: u32, types: &[NameId], ctors: &[NameI
             rules.push((ctor_real, cr.b_u.len(), rhs));
         }
         let lparams_d = rec_lparams.clone();
-        derived.push(DerivedRec { name: rec_id[d], lparams: lparams_d, ty: rec_ty, nidx: blk.tys[d].nidx, rules });
+        derived.push(DerivedRec { lparams: lparams_d, ty: rec_ty, nidx: blk.tys[d].nidx, rules });
     }
 
     // Phase H: compare with the file (I1). Inductive types.
@@ -1200,6 +1194,8 @@ fn check_safe_block(tc: &mut Checker, pos: u32, types: &[NameId], ctors: &[NameI
         if rci.level_params != der.lparams {
             return reject("recursor universe parameters mismatch");
         }
+        // The derived type is well typed (defensive, as the reference's check_recursors).
+        tc.infer(der.ty, true)?;
         let fty = tc.import_expr(rci.ty);
         if fty != der.ty && !tc.is_def_eq(fty, der.ty)? {
             return reject(format!("recursor type mismatch for '{}'", env.raw.name_to_string(rname)));
@@ -1213,7 +1209,7 @@ fn check_safe_block(tc: &mut Checker, pos: u32, types: &[NameId], ctors: &[NameI
         if ri.k != k_target {
             return reject("recursor k flag mismatch");
         }
-        if ri.is_unsafe {
+        if ri.is_unsafe || rci.is_unsafe {
             return reject("recursor safety mismatch");
         }
         if ri.rules.len() != der.rules.len() {
@@ -1232,8 +1228,247 @@ fn check_safe_block(tc: &mut Checker, pos: u32, types: &[NameId], ctors: &[NameI
     Ok(())
 }
 
-/// Closes the residual `pre` (over the parameter locals) under the parameter binders, using the
-/// parameter types of the block. Used only to type-check auxiliary constructor types.
+/// Closes the residual `pre` (over the parameter locals) under the parameter binders, giving a
+/// closed type that can be checked. Used for auxiliary constructor types, which have no own type.
 fn close_params(tc: &mut Checker, blk: &Blk, pre: TermId) -> R<TermId> {
     blk.close(tc, &blk.params, pre, true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parse;
+
+    /// Mutual `Prop` block `A.mk : B -> A`, `B.mk : A -> B` (no parameters, no universe
+    /// parameters) with the recursors written out from the Lean 4 rules: `A.rec` and `B.rec`
+    /// take two motives and two minor premises, and each rule has one field.
+    const MUTUAL: &str = r#"{"meta": {"exporter": {"name": "lean4export", "version": "3.1.0"}, "format": {"version": "3.1.0"}, "lean": {"githash": "x", "version": "4.34.1"}}}
+{"sort":0,"ie":0}
+{"in":1,"str":{"pre":0,"str":"B"}}
+{"const":{"name":1,"us":[]},"ie":1}
+{"in":2,"str":{"pre":0,"str":"A"}}
+{"const":{"name":2,"us":[]},"ie":2}
+{"in":3,"str":{"pre":0,"str":"a"}}
+{"forallE":{"binderInfo":"default","body":2,"name":3,"type":1},"ie":3}
+{"const":{"name":2,"us":[]},"ie":4}
+{"const":{"name":1,"us":[]},"ie":5}
+{"forallE":{"binderInfo":"default","body":5,"name":3,"type":4},"ie":6}
+{"sort":0,"ie":7}
+{"const":{"name":2,"us":[]},"ie":8}
+{"sort":0,"ie":9}
+{"in":4,"str":{"pre":0,"str":"x"}}
+{"forallE":{"binderInfo":"default","body":9,"name":4,"type":8},"ie":10}
+{"const":{"name":1,"us":[]},"ie":11}
+{"sort":0,"ie":12}
+{"forallE":{"binderInfo":"default","body":12,"name":4,"type":11},"ie":13}
+{"const":{"name":1,"us":[]},"ie":14}
+{"bvar":1,"ie":15}
+{"bvar":0,"ie":16}
+{"app":{"arg":16,"fn":15},"ie":17}
+{"bvar":3,"ie":18}
+{"in":5,"str":{"pre":2,"str":"mk"}}
+{"const":{"name":5,"us":[]},"ie":19}
+{"bvar":1,"ie":20}
+{"app":{"arg":20,"fn":19},"ie":21}
+{"app":{"arg":21,"fn":18},"ie":22}
+{"in":6,"str":{"pre":0,"str":"ih"}}
+{"forallE":{"binderInfo":"default","body":22,"name":6,"type":17},"ie":23}
+{"forallE":{"binderInfo":"default","body":23,"name":3,"type":14},"ie":24}
+{"const":{"name":2,"us":[]},"ie":25}
+{"bvar":3,"ie":26}
+{"bvar":0,"ie":27}
+{"app":{"arg":27,"fn":26},"ie":28}
+{"bvar":3,"ie":29}
+{"in":7,"str":{"pre":1,"str":"mk"}}
+{"const":{"name":7,"us":[]},"ie":30}
+{"bvar":1,"ie":31}
+{"app":{"arg":31,"fn":30},"ie":32}
+{"app":{"arg":32,"fn":29},"ie":33}
+{"forallE":{"binderInfo":"default","body":33,"name":6,"type":28},"ie":34}
+{"forallE":{"binderInfo":"default","body":34,"name":3,"type":25},"ie":35}
+{"const":{"name":2,"us":[]},"ie":36}
+{"bvar":4,"ie":37}
+{"bvar":0,"ie":38}
+{"app":{"arg":38,"fn":37},"ie":39}
+{"in":8,"str":{"pre":0,"str":"t"}}
+{"forallE":{"binderInfo":"default","body":39,"name":8,"type":36},"ie":40}
+{"in":9,"str":{"pre":0,"str":"mB"}}
+{"forallE":{"binderInfo":"default","body":40,"name":9,"type":35},"ie":41}
+{"in":10,"str":{"pre":0,"str":"mA"}}
+{"forallE":{"binderInfo":"default","body":41,"name":10,"type":24},"ie":42}
+{"in":11,"str":{"pre":0,"str":"m2"}}
+{"forallE":{"binderInfo":"default","body":42,"name":11,"type":13},"ie":43}
+{"in":12,"str":{"pre":0,"str":"m1"}}
+{"forallE":{"binderInfo":"default","body":43,"name":12,"type":10},"ie":44}
+{"const":{"name":2,"us":[]},"ie":45}
+{"sort":0,"ie":46}
+{"forallE":{"binderInfo":"default","body":46,"name":4,"type":45},"ie":47}
+{"const":{"name":1,"us":[]},"ie":48}
+{"sort":0,"ie":49}
+{"forallE":{"binderInfo":"default","body":49,"name":4,"type":48},"ie":50}
+{"const":{"name":1,"us":[]},"ie":51}
+{"bvar":1,"ie":52}
+{"bvar":0,"ie":53}
+{"app":{"arg":53,"fn":52},"ie":54}
+{"bvar":3,"ie":55}
+{"const":{"name":5,"us":[]},"ie":56}
+{"bvar":1,"ie":57}
+{"app":{"arg":57,"fn":56},"ie":58}
+{"app":{"arg":58,"fn":55},"ie":59}
+{"forallE":{"binderInfo":"default","body":59,"name":6,"type":54},"ie":60}
+{"forallE":{"binderInfo":"default","body":60,"name":3,"type":51},"ie":61}
+{"const":{"name":2,"us":[]},"ie":62}
+{"bvar":3,"ie":63}
+{"bvar":0,"ie":64}
+{"app":{"arg":64,"fn":63},"ie":65}
+{"bvar":3,"ie":66}
+{"const":{"name":7,"us":[]},"ie":67}
+{"bvar":1,"ie":68}
+{"app":{"arg":68,"fn":67},"ie":69}
+{"app":{"arg":69,"fn":66},"ie":70}
+{"forallE":{"binderInfo":"default","body":70,"name":6,"type":65},"ie":71}
+{"forallE":{"binderInfo":"default","body":71,"name":3,"type":62},"ie":72}
+{"const":{"name":1,"us":[]},"ie":73}
+{"bvar":3,"ie":74}
+{"bvar":0,"ie":75}
+{"app":{"arg":75,"fn":74},"ie":76}
+{"forallE":{"binderInfo":"default","body":76,"name":8,"type":73},"ie":77}
+{"forallE":{"binderInfo":"default","body":77,"name":9,"type":72},"ie":78}
+{"forallE":{"binderInfo":"default","body":78,"name":10,"type":61},"ie":79}
+{"forallE":{"binderInfo":"default","body":79,"name":11,"type":50},"ie":80}
+{"forallE":{"binderInfo":"default","body":80,"name":12,"type":47},"ie":81}
+{"const":{"name":2,"us":[]},"ie":82}
+{"sort":0,"ie":83}
+{"forallE":{"binderInfo":"default","body":83,"name":4,"type":82},"ie":84}
+{"const":{"name":1,"us":[]},"ie":85}
+{"sort":0,"ie":86}
+{"forallE":{"binderInfo":"default","body":86,"name":4,"type":85},"ie":87}
+{"const":{"name":1,"us":[]},"ie":88}
+{"bvar":1,"ie":89}
+{"bvar":0,"ie":90}
+{"app":{"arg":90,"fn":89},"ie":91}
+{"bvar":3,"ie":92}
+{"const":{"name":5,"us":[]},"ie":93}
+{"bvar":1,"ie":94}
+{"app":{"arg":94,"fn":93},"ie":95}
+{"app":{"arg":95,"fn":92},"ie":96}
+{"forallE":{"binderInfo":"default","body":96,"name":6,"type":91},"ie":97}
+{"forallE":{"binderInfo":"default","body":97,"name":3,"type":88},"ie":98}
+{"const":{"name":2,"us":[]},"ie":99}
+{"bvar":3,"ie":100}
+{"bvar":0,"ie":101}
+{"app":{"arg":101,"fn":100},"ie":102}
+{"bvar":3,"ie":103}
+{"const":{"name":7,"us":[]},"ie":104}
+{"bvar":1,"ie":105}
+{"app":{"arg":105,"fn":104},"ie":106}
+{"app":{"arg":106,"fn":103},"ie":107}
+{"forallE":{"binderInfo":"default","body":107,"name":6,"type":102},"ie":108}
+{"forallE":{"binderInfo":"default","body":108,"name":3,"type":99},"ie":109}
+{"const":{"name":1,"us":[]},"ie":110}
+{"bvar":2,"ie":111}
+{"bvar":0,"ie":112}
+{"app":{"arg":112,"fn":111},"ie":113}
+{"in":13,"str":{"pre":1,"str":"rec"}}
+{"const":{"name":13,"us":[]},"ie":114}
+{"bvar":4,"ie":115}
+{"app":{"arg":115,"fn":114},"ie":116}
+{"bvar":3,"ie":117}
+{"app":{"arg":117,"fn":116},"ie":118}
+{"bvar":2,"ie":119}
+{"app":{"arg":119,"fn":118},"ie":120}
+{"bvar":1,"ie":121}
+{"app":{"arg":121,"fn":120},"ie":122}
+{"bvar":0,"ie":123}
+{"app":{"arg":123,"fn":122},"ie":124}
+{"app":{"arg":124,"fn":113},"ie":125}
+{"lam":{"binderInfo":"default","body":125,"name":3,"type":110},"ie":126}
+{"lam":{"binderInfo":"default","body":126,"name":9,"type":109},"ie":127}
+{"lam":{"binderInfo":"default","body":127,"name":10,"type":98},"ie":128}
+{"lam":{"binderInfo":"default","body":128,"name":11,"type":87},"ie":129}
+{"lam":{"binderInfo":"default","body":129,"name":12,"type":84},"ie":130}
+{"const":{"name":2,"us":[]},"ie":131}
+{"sort":0,"ie":132}
+{"forallE":{"binderInfo":"default","body":132,"name":4,"type":131},"ie":133}
+{"const":{"name":1,"us":[]},"ie":134}
+{"sort":0,"ie":135}
+{"forallE":{"binderInfo":"default","body":135,"name":4,"type":134},"ie":136}
+{"const":{"name":1,"us":[]},"ie":137}
+{"bvar":1,"ie":138}
+{"bvar":0,"ie":139}
+{"app":{"arg":139,"fn":138},"ie":140}
+{"bvar":3,"ie":141}
+{"const":{"name":5,"us":[]},"ie":142}
+{"bvar":1,"ie":143}
+{"app":{"arg":143,"fn":142},"ie":144}
+{"app":{"arg":144,"fn":141},"ie":145}
+{"forallE":{"binderInfo":"default","body":145,"name":6,"type":140},"ie":146}
+{"forallE":{"binderInfo":"default","body":146,"name":3,"type":137},"ie":147}
+{"const":{"name":2,"us":[]},"ie":148}
+{"bvar":3,"ie":149}
+{"bvar":0,"ie":150}
+{"app":{"arg":150,"fn":149},"ie":151}
+{"bvar":3,"ie":152}
+{"const":{"name":7,"us":[]},"ie":153}
+{"bvar":1,"ie":154}
+{"app":{"arg":154,"fn":153},"ie":155}
+{"app":{"arg":155,"fn":152},"ie":156}
+{"forallE":{"binderInfo":"default","body":156,"name":6,"type":151},"ie":157}
+{"forallE":{"binderInfo":"default","body":157,"name":3,"type":148},"ie":158}
+{"const":{"name":2,"us":[]},"ie":159}
+{"bvar":1,"ie":160}
+{"bvar":0,"ie":161}
+{"app":{"arg":161,"fn":160},"ie":162}
+{"in":14,"str":{"pre":2,"str":"rec"}}
+{"const":{"name":14,"us":[]},"ie":163}
+{"bvar":4,"ie":164}
+{"app":{"arg":164,"fn":163},"ie":165}
+{"bvar":3,"ie":166}
+{"app":{"arg":166,"fn":165},"ie":167}
+{"bvar":2,"ie":168}
+{"app":{"arg":168,"fn":167},"ie":169}
+{"bvar":1,"ie":170}
+{"app":{"arg":170,"fn":169},"ie":171}
+{"bvar":0,"ie":172}
+{"app":{"arg":172,"fn":171},"ie":173}
+{"app":{"arg":173,"fn":162},"ie":174}
+{"lam":{"binderInfo":"default","body":174,"name":3,"type":159},"ie":175}
+{"lam":{"binderInfo":"default","body":175,"name":9,"type":158},"ie":176}
+{"lam":{"binderInfo":"default","body":176,"name":10,"type":147},"ie":177}
+{"lam":{"binderInfo":"default","body":177,"name":11,"type":136},"ie":178}
+{"lam":{"binderInfo":"default","body":178,"name":12,"type":133},"ie":179}
+{"inductive":{"ctors":[{"cidx":0,"induct":2,"isUnsafe":false,"levelParams":[],"name":5,"numFields":1,"numParams":0,"type":3},{"cidx":0,"induct":1,"isUnsafe":false,"levelParams":[],"name":7,"numFields":1,"numParams":0,"type":6}],"recs":[{"all":[2,1],"isUnsafe":false,"k":false,"levelParams":[],"name":14,"numIndices":0,"numMinors":2,"numMotives":2,"numParams":0,"rules":[{"ctor":5,"nfields":1,"rhs":130}],"type":44},{"all":[2,1],"isUnsafe":false,"k":false,"levelParams":[],"name":13,"numIndices":0,"numMinors":2,"numMotives":2,"numParams":0,"rules":[{"ctor":7,"nfields":1,"rhs":179}],"type":81}],"types":[{"all":[2,1],"ctors":[5],"isRec":true,"isReflexive":false,"isUnsafe":false,"levelParams":[],"name":2,"numIndices":0,"numNested":0,"numParams":0,"type":7},{"all":[2,1],"ctors":[7],"isRec":true,"isReflexive":false,"isUnsafe":false,"levelParams":[],"name":1,"numIndices":0,"numNested":0,"numParams":0,"type":7}]}}
+"#;
+
+    fn check_file(src: &str) -> Result<(), String> {
+        let env = parse::load(src.as_bytes()).map_err(|e| format!("{:?}", e))?;
+        let mut tc = Checker::new(&env);
+        for pos in 0..env.raw.decls.len() {
+            tc.check_decl(pos as u32).map_err(|f| format!("{:?}", f))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mutual_block_accepted() {
+        assert_eq!(check_file(MUTUAL), Ok(()));
+    }
+
+    #[test]
+    fn mutual_block_rule_field_count_rejected() {
+        let bad = MUTUAL.replacen("\"nfields\":1", "\"nfields\":0", 1);
+        assert!(check_file(&bad).is_err());
+    }
+
+    #[test]
+    fn mutual_block_minor_count_rejected() {
+        let bad = MUTUAL.replacen("\"numMinors\":2", "\"numMinors\":1", 1);
+        assert!(check_file(&bad).is_err());
+    }
+
+    #[test]
+    fn mutual_block_is_rec_flag_rejected() {
+        let bad = MUTUAL.replacen("\"isRec\":true", "\"isRec\":false", 1);
+        assert!(check_file(&bad).is_err());
+    }
 }
