@@ -13,6 +13,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::io::{self, Read};
 
 use crate::bignat::BigNat;
 use crate::env::*;
@@ -267,22 +268,103 @@ pub(crate) struct Loader {
     scratch: Vec<u8>,
 }
 
+/// The sequential loader's per-line state: the raw lines of the file go in, in order.
+/// `load` and `load_stream` both feed it, so they agree by construction.
+struct LineFeed {
+    /// Lines seen so far (1-based number of the last line).
+    n: usize,
+    /// `None` until the meta line (the first non-empty line) has been checked.
+    ld: Option<Loader>,
+}
+
+impl LineFeed {
+    fn new() -> Self {
+        LineFeed { n: 0, ld: None }
+    }
+
+    /// One segment between newlines (as `lines` yields them), blank or not.
+    #[inline]
+    fn line(&mut self, raw: &[u8]) -> LResult<()> {
+        self.n += 1;
+        let l = trim(raw);
+        if l.is_empty() {
+            return Ok(());
+        }
+        let n = self.n;
+        match &mut self.ld {
+            Some(ld) => item_line(ld, l).map_err(|e| e.at_line(n)),
+            None => {
+                meta_line(l).map_err(|e| e.at_line(n))?;
+                self.ld = Some(Loader::new());
+                Ok(())
+            }
+        }
+    }
+
+    fn finish(self) -> LResult<Env> {
+        match self.ld {
+            Some(ld) => ld.finish(),
+            None => reject("empty file: missing meta line"),
+        }
+    }
+}
+
 /// Parses an export file.
 pub fn load(bytes: &[u8]) -> Result<Env, LoadError> {
-    let mut lines = lines(bytes)
-        .enumerate()
-        .map(|(i, l)| (i + 1, trim(l)))
-        .filter(|(_, l)| !l.is_empty());
-    let (n0, first) = match lines.next() {
-        Some(x) => x,
-        None => return reject("empty file: missing meta line"),
-    };
-    meta_line(first).map_err(|e| e.at_line(n0))?;
-    let mut ld = Loader::new();
-    for (n, line) in lines {
-        item_line(&mut ld, line).map_err(|e| e.at_line(n))?;
+    let mut feed = LineFeed::new();
+    for l in lines(bytes) {
+        feed.line(l)?;
     }
-    ld.finish()
+    feed.finish()
+}
+
+/// Bytes `load_stream` asks the reader for at a time.
+const STREAM_BLOCK: usize = 1 << 20;
+
+/// `load` over a reader: the same result as `load` of all the reader's bytes, holding
+/// only the current block (plus an unfinished line) in memory. `Err` is a read error.
+pub fn load_stream<R: Read>(src: &mut R) -> io::Result<Result<Env, LoadError>> {
+    load_stream_with(src, STREAM_BLOCK)
+}
+
+/// `load_stream` with an explicit block size (tests use tiny blocks).
+pub(crate) fn load_stream_with<R: Read>(src: &mut R, block: usize) -> io::Result<Result<Env, LoadError>> {
+    let block = block.max(1);
+    let mut feed = LineFeed::new();
+    // `buf[..len]` holds the bytes read and not yet consumed; it starts with an unfinished line.
+    let mut buf: Vec<u8> = Vec::new();
+    let mut len = 0usize;
+    loop {
+        if buf.len() < len + block {
+            buf.resize(len + block, 0);
+        }
+        let got = match src.read(&mut buf[len..len + block]) {
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if got == 0 {
+            // The last segment has no newline (and may be empty), as in `lines`.
+            if let Err(e) = feed.line(&buf[..len]) {
+                return Ok(Err(e));
+            }
+            return Ok(feed.finish());
+        }
+        // Only the new bytes can hold a newline.
+        let fresh = len;
+        len += got;
+        let Some(last) = buf[fresh..len].iter().rposition(|&b| b == b'\n').map(|p| fresh + p) else {
+            continue;
+        };
+        // `buf[..last]` is a run of whole lines; the newline at `last` ends the final one.
+        for l in lines(&buf[..last]) {
+            if let Err(e) = feed.line(l) {
+                return Ok(Err(e));
+            }
+        }
+        buf.copy_within(last + 1..len, 0);
+        len -= last + 1;
+    }
 }
 
 pub(crate) fn meta_line(line: &[u8]) -> LResult<()> {
@@ -1449,6 +1531,89 @@ mod tests {
         match e {
             LoadError::Reject(m) => assert!(m.starts_with("line 3:"), "{m}"),
             other => panic!("{other:?}"),
+        }
+    }
+
+    /// Asserts that `load_stream_with` agrees with `load` for these bytes and block size.
+    fn stream_agrees(bytes: &[u8], block: usize) {
+        let seq = load(bytes);
+        let st = load_stream_with(&mut &bytes[..], block).expect("a slice reads without error");
+        match (&seq, &st) {
+            (Ok(a), Ok(b)) => assert!(
+                a.raw.names == b.raw.names
+                    && a.raw.levels == b.raw.levels
+                    && a.raw.exprs == b.raw.exprs
+                    && a.raw.const_levels == b.raw.const_levels
+                    && a.raw.nats == b.raw.nats
+                    && a.raw.strs == b.raw.strs
+                    && a.raw.decls == b.raw.decls
+                    && a.consts == b.consts
+                    && a.builtins == b.builtins,
+                "envs differ (block {block})"
+            ),
+            (Err(a), Err(b)) => assert_eq!(a, b, "errors differ (block {block})"),
+            _ => panic!("outcomes differ (block {block}): {:?} vs {:?}", seq.as_ref().err(), st.as_ref().err()),
+        }
+    }
+
+    #[test]
+    fn stream_agrees_at_every_block_size() {
+        let mut crlf = String::from("\n \r\n");
+        crlf.push_str(META);
+        for l in NAT {
+            crlf.push_str("\r\n\n");
+            crlf.push_str(l);
+        }
+        let texts = [
+            file(NAT),
+            file(NAT) + "\n",
+            file(NAT) + "\n\n  ",
+            crlf,
+            // Errors carry the same line number, also on a last line without a newline.
+            file(&[r#"{"ie":0,"sort":0}"#, "", r#"{"ie":1,"sort":9}"#, r#"{"ie":2,"sort":0}"#]),
+            file(&[r#"{"ie":0,"sort":0}"#, r#"{"ie":1,"sort":"#]),
+            file(&[r#"{"ie":0,"sort":0}"#]) + "\n\n{\"frob\":{}}",
+            String::new(),
+            "\n\n".to_string(),
+            "\n\n{\"meta\":{\"format\":{\"version\":\"4.0.0\"}}}\n".to_string(),
+            r#"{"in":1,"str":{"pre":0,"str":"a"}}"#.to_string(),
+        ];
+        for text in &texts {
+            let bytes = text.as_bytes();
+            for block in 1..=bytes.len() + 2 {
+                stream_agrees(bytes, block);
+            }
+        }
+    }
+
+    #[test]
+    fn stream_read_error_is_reported() {
+        struct Failing(usize);
+        impl Read for Failing {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.0 == 0 {
+                    return Err(io::Error::other("disk on fire"));
+                }
+                self.0 -= 1;
+                buf[0] = b'\n';
+                Ok(1)
+            }
+        }
+        assert!(load_stream(&mut Failing(3)).is_err());
+    }
+
+    /// Every arena file streamed in 4 KB blocks: same outcome as `load`.
+    #[test]
+    fn arena_files_stream_like_load() {
+        let root = Path::new("/home/user/Palladium/arena-tests");
+        if !root.is_dir() {
+            return;
+        }
+        let mut files = Vec::new();
+        collect(&root.join("good"), &mut files);
+        collect(&root.join("bad"), &mut files);
+        for f in &files {
+            stream_agrees(&fs::read(f).expect("read"), 4096);
         }
     }
 }

@@ -138,55 +138,76 @@ fn worker(env: &Env, counter: &AtomicUsize, fault: &Mutex<Option<String>>, total
     }
 }
 
-/// Peak resident set size (VmHWM) in KiB, or 0 when unavailable.
-fn peak_rss_kib() -> u64 {
+/// A `kB` field of /proc/self/status, or 0 when unavailable.
+fn status_kib(field: &str) -> u64 {
     std::fs::read_to_string("/proc/self/status")
         .ok()
         .and_then(|s| {
             s.lines()
-                .find_map(|l| l.strip_prefix("VmHWM:"))
+                .find_map(|l| l.strip_prefix(field))
                 .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
         })
         .unwrap_or(0)
+}
+
+/// Peak resident set size (VmHWM) in KiB.
+fn peak_rss_kib() -> u64 {
+    status_kib("VmHWM:")
+}
+
+/// Current resident set size (VmRSS) in KiB.
+fn rss_kib() -> u64 {
+    status_kib("VmRSS:")
 }
 
 fn main() {
     panic::set_hook(Box::new(|_| {}));
     let opts = parse_args();
     let trace = std::env::var_os("PALLADIUM_TRACE").is_some();
-    let t_read = std::time::Instant::now();
-    let bytes = if opts.input == "-" {
-        let mut v = Vec::new();
-        if let Err(e) = std::io::stdin().read_to_end(&mut v) {
-            eprintln!("error: reading stdin: {e}");
-            process::exit(4);
-        }
-        v
+    let jobs = opts
+        .jobs
+        .unwrap_or_else(|| thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(8))
+        .max(1);
+    let t_parse = std::time::Instant::now();
+    // A regular file is parsed as it is read, a bounded piece at a time, so its bytes are
+    // never all in memory. Anything else (stdin, a pipe) cannot be read twice, which the
+    // parallel loader's fallback needs, so it is read whole unless `--sequential` is given.
+    let file = if opts.input == "-" {
+        None
     } else {
-        match std::fs::read(&opts.input) {
-            Ok(v) => v,
+        match std::fs::File::open(&opts.input) {
+            Ok(f) => Some(f),
             Err(e) => {
                 eprintln!("error: reading {}: {e}", opts.input);
                 process::exit(4);
             }
         }
     };
-    let jobs = opts
-        .jobs
-        .unwrap_or_else(|| thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(8))
-        .max(1);
-    if trace {
-        eprintln!("trace: read {:.3}s, {} bytes", t_read.elapsed().as_secs_f64(), bytes.len());
-    }
-    let t_parse = std::time::Instant::now();
-    let loaded = if opts.sequential {
-        parse::load(&bytes)
-    } else {
-        parse_par::load_parallel(&bytes, jobs)
+    let regular = file.as_ref().is_some_and(|f| f.metadata().is_ok_and(|m| m.is_file()));
+    let loaded = match file {
+        Some(mut f) if opts.sequential => parse::load_stream(&mut f),
+        Some(mut f) if regular => parse_par::load_parallel_stream(&mut f, jobs),
+        None if opts.sequential => parse::load_stream(&mut std::io::stdin().lock()),
+        other => {
+            let mut bytes = Vec::new();
+            let read = match other {
+                Some(mut f) => f.read_to_end(&mut bytes),
+                None => std::io::stdin().lock().read_to_end(&mut bytes),
+            };
+            read.map(|_| parse_par::load_parallel(&bytes, jobs))
+        }
+    };
+    let loaded = match loaded {
+        Ok(l) => l,
+        Err(e) => {
+            let what = if opts.input == "-" { "stdin" } else { opts.input.as_str() };
+            eprintln!("error: reading {what}: {e}");
+            process::exit(4);
+        }
     };
     if trace {
         let mode = if opts.sequential { "sequential".to_string() } else { format!("{jobs} threads") };
-        eprintln!("trace: parse and env build {:.3}s ({mode})", t_parse.elapsed().as_secs_f64());
+        eprintln!("trace: read, parse and env build {:.3}s ({mode})", t_parse.elapsed().as_secs_f64());
     }
     let env = match loaded {
         Ok(e) => e,
@@ -199,10 +220,8 @@ fn main() {
             process::exit(2);
         }
     };
-    // The file bytes are not needed past this point.
-    drop(bytes);
     if trace {
-        eprintln!("trace: peak RSS after load {}", peak_rss_kib());
+        eprintln!("trace: peak RSS after load {} KiB, current RSS {} KiB", peak_rss_kib(), rss_kib());
     }
     if opts.parse_only {
         if !opts.quiet {
