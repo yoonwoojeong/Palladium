@@ -813,7 +813,7 @@ mod tests {
     /// Every arena file: 4 workers, 4 KB chunks, same outcome as the sequential loader.
     #[test]
     fn arena_files_agree_with_sequential() {
-        let root = Path::new("/home/user/Palladium/arena-tests");
+        let root = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/arena-tests"));
         if !root.is_dir() {
             return;
         }

@@ -1477,7 +1477,7 @@ mod tests {
 
     #[test]
     fn arena_corpus() {
-        let root = Path::new("/home/user/Palladium/arena-tests");
+        let root = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/arena-tests"));
         if !root.is_dir() {
             return;
         }
@@ -1506,7 +1506,7 @@ mod tests {
     #[test]
     #[ignore]
     fn bench_load_grind_ring() {
-        let path = Path::new("/home/user/Palladium/arena-tests/good/perf/grind-ring-5.ndjson");
+        let path = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/arena-tests/good/perf/grind-ring-5.ndjson"));
         let bytes = fs::read(path).expect("read perf file");
         let runs = 5;
         let mut best = f64::MAX;
@@ -1605,7 +1605,7 @@ mod tests {
     /// Every arena file streamed in 4 KB blocks: same outcome as `load`.
     #[test]
     fn arena_files_stream_like_load() {
-        let root = Path::new("/home/user/Palladium/arena-tests");
+        let root = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/arena-tests"));
         if !root.is_dir() {
             return;
         }

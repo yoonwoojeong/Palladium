@@ -1,4 +1,5 @@
-//! `palladium [-j N] [-q] <file | ->`: checks an export file (docs/DESIGN.md section 7).
+//! `palladium [-j N] [-q] [--parse-only] [--sequential] <file | ->`: checks an export file
+//! (docs/DESIGN.md section 7).
 //! Exit codes: 0 valid, 1 rejected, 2 declined, 3 faults (resource limit / internal), 4 I/O or setup error.
 
 use std::io::Read;
@@ -27,7 +28,7 @@ struct Opts {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: palladium [-j N] [-q] [--parse-only] <file | ->");
+    eprintln!("usage: palladium [-j N] [-q] [--parse-only] [--sequential] <file | ->");
     process::exit(4)
 }
 

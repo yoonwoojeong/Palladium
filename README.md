@@ -37,7 +37,11 @@ Debug switches: `PALLADIUM_TRACE=1` (per-declaration timings), `PALLADIUM_CHECK_
 Passes the arena's downloadable suite (all valid files accepted, all invalid files
 rejected) and accepts the `Init` (58k declarations, ~5 s) and `Std` (98k declarations, ~8 s)
 exports of Lean 4.34.1 on 4 threads, and all of Mathlib v4.34.1 (702,040 declarations,
-6.2 GB export) in 207–250 s (two runs) with a 10.5 GB peak. Reduction-heavy proofs
+6.2 GB export) in 207–250 s (two runs) with a 10.5 GB peak. That run predates the
+streaming loader: a file is now parsed as it is read, in bounded pieces, so the export is
+never in memory as a whole (an export on stdin still is, unless `--sequential` is given).
+On a synthetic export of the same size the peak after load went from 10.7 GB to 3.5 GB;
+the Mathlib figures have not been re-measured. Reduction-heavy proofs
 (`decide` over large search spaces) are slow compared with environment-machine kernels.
 
 ## Arena checker definition
