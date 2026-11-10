@@ -108,6 +108,10 @@ pub struct Checker<'e> {
     ctx_id: Vec<u32>,
     ctx_ub: Vec<u32>,
     ctx_intern: FxHashMap<(u32, TermId), u32>,
+    /// Interned suffixes of the context (innermost entries), keyed by (entry, suffix below it).
+    ctx_sintern: FxHashMap<(TermId, u32), u32>,
+    /// Loose-bvar masks of open terms (see `loose_mask`).
+    bmask: FxHashMap<TermId, u64>,
     /// `infer_ctx` results for open terms, keyed by `(term << 32) | CtxId`.
     infer_open_chk: FxHashMap<u64, TermId>,
     infer_open_only: FxHashMap<u64, TermId>,
@@ -123,7 +127,7 @@ pub struct Checker<'e> {
     pub dbg_max: Option<u32>,
     /// `PALLADIUM_TRACE_DEFEQ_POS=<decl position>`: restricts the def-eq tree to one declaration.
     dbg_pos: Option<u32>,
-    pub dbg_cnt: [u64; 24],
+    pub dbg_cnt: [u64; 48],
     pub dbg_unfold: FxHashMap<NameId, u64>,
 }
 
@@ -156,6 +160,8 @@ impl<'e> Checker<'e> {
             ctx_id: Vec::new(),
             ctx_ub: Vec::new(),
             ctx_intern: FxHashMap::default(),
+            ctx_sintern: FxHashMap::default(),
+            bmask: FxHashMap::default(),
             infer_open_chk: FxHashMap::default(),
             infer_open_only: FxHashMap::default(),
             inst_memo: FxHashMap::default(),
@@ -165,7 +171,7 @@ impl<'e> Checker<'e> {
             in_oracle: false,
             dbg_max: std::env::var("PALLADIUM_TRACE_DEFEQ").ok().and_then(|v| v.parse().ok()),
             dbg_pos: std::env::var("PALLADIUM_TRACE_DEFEQ_POS").ok().and_then(|v| v.parse().ok()),
-            dbg_cnt: [0; 24],
+            dbg_cnt: [0; 48],
             dbg_unfold: FxHashMap::default(),
         };
         c.reset();
@@ -204,6 +210,8 @@ impl<'e> Checker<'e> {
         self.ctx_id.clear();
         self.ctx_ub.clear();
         self.ctx_intern.clear();
+        self.ctx_sintern.clear();
+        self.bmask.clear();
         self.infer_open_chk.clear();
         self.infer_open_only.clear();
         self.inst_memo.clear();
@@ -548,6 +556,72 @@ impl<'e> Checker<'e> {
 
     // ----- context ---------------------------------------------------------------
 
+    /// Set of loose bvar indices of `t` (bit `i` for `#i`, relative to `t`). Bit 63 is set when
+    /// some index is `>= 63` (the caller then falls back to the coarser key).
+    fn loose_mask(&mut self, t: TermId) -> u64 {
+        if self.store.lbr(t) == 0 {
+            return 0;
+        }
+        if let Some(&m) = self.bmask.get(&t) {
+            return m;
+        }
+        let shift = |m: u64| (m & !(1u64 << 63)) >> 1 | (m & (1u64 << 63));
+        let m = match self.store.get(t) {
+            Term::BVar(i) => {
+                if i < 63 {
+                    1u64 << i
+                } else {
+                    1u64 << 63
+                }
+            }
+            Term::App(f, a) => self.loose_mask(f) | self.loose_mask(a),
+            Term::Lam(d, b) | Term::Pi(d, b) => self.loose_mask(d) | shift(self.loose_mask(b)),
+            Term::Let(ty, v, b) => self.loose_mask(ty) | self.loose_mask(v) | shift(self.loose_mask(b)),
+            Term::Proj(_, _, e) => self.loose_mask(e),
+            _ => 0,
+        };
+        self.bmask.insert(t, m);
+        m
+    }
+
+    /// Interned key of the context entries that `t` (open) actually refers to: the entries of
+    /// its loose bvars, innermost first. `None` when a bvar is out of range.
+    fn ctx_dep_id(&mut self, t: TermId) -> Option<u32> {
+        let m = self.loose_mask(t);
+        if m >> 63 != 0 {
+            return self.ctx_suffix_id(self.store.lbr(t));
+        }
+        let len = self.ctx.len();
+        let mut sid = 0u32;
+        let mut bits = m;
+        while bits != 0 {
+            let i = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            if i >= len {
+                return None;
+            }
+            let next = self.ctx_sintern.len() as u32 + 1;
+            sid = *self.ctx_sintern.entry((self.ctx[len - 1 - i], sid)).or_insert(next);
+        }
+        Some(sid)
+    }
+
+    /// Interned id of the innermost `k` context entries (0 for `k == 0`), or `None` when the
+    /// context is shorter than `k`.
+    fn ctx_suffix_id(&mut self, k: u32) -> Option<u32> {
+        let len = self.ctx.len();
+        let k = k as usize;
+        if k > len {
+            return None;
+        }
+        let mut sid = 0u32;
+        for j in (len - k)..len {
+            let next = self.ctx_sintern.len() as u32 + 1;
+            sid = *self.ctx_sintern.entry((self.ctx[j], sid)).or_insert(next);
+        }
+        Some(sid)
+    }
+
     #[inline]
     fn ctx_cur_id(&self) -> u32 {
         self.ctx_id.last().copied().unwrap_or(0)
@@ -669,9 +743,23 @@ impl<'e> Checker<'e> {
     fn infer_ctx_core(&mut self, t: TermId, check: bool) -> R<TermId> {
         self.stats[0] += 1;
         let closed = self.store.lbr(t) == 0;
-        let key = ((t as u64) << 32) | self.ctx_cur_id() as u64;
+        // Open terms are keyed by the innermost `lbr(t)` context entries only: those are the
+        // only entries the result can depend on (P2: locals and let values are self-describing).
+        // A loose bvar is answered by its (closed) context entry, which is cached on its own.
+        if !closed && matches!(self.store.get(t), Term::BVar(_)) {
+            return self.infer_node_uncached(t, check);
+        }
+        let key = if closed {
+            0
+        } else {
+            match self.ctx_dep_id(t) {
+                Some(s) => ((t as u64) << 32) | s as u64,
+                None => return self.infer_node_uncached(t, check),
+            }
+        };
         if closed {
             if let Some(r) = self.infer_chk.get(t) {
+                self.dbg(43);
                 return Ok(r);
             }
             if !check {
@@ -681,6 +769,7 @@ impl<'e> Checker<'e> {
             }
         } else {
             if let Some(&r) = self.infer_open_chk.get(&key) {
+                self.dbg(45);
                 return Ok(r);
             }
             if !check {
@@ -689,6 +778,7 @@ impl<'e> Checker<'e> {
                 }
             }
         }
+        self.dbg(if closed { 44 } else { 46 });
         let r = self.infer_node(t, check)?;
         match (closed, check) {
             (true, true) => self.infer_chk.insert(t, r),
@@ -701,6 +791,10 @@ impl<'e> Checker<'e> {
             }
         }
         Ok(r)
+    }
+
+    fn infer_node_uncached(&mut self, t: TermId, check: bool) -> R<TermId> {
+        self.infer_node(t, check)
     }
 
     fn infer_node(&mut self, t: TermId, check: bool) -> R<TermId> {
@@ -983,10 +1077,12 @@ impl<'e> Checker<'e> {
         if self.is_eager_reduce_arg(a) {
             let old = self.eager_reduce;
             self.eager_reduce = true;
+            self.dbg(33);
             let r = self.is_def_eq(at, dom);
             self.eager_reduce = old;
             r
         } else {
+            self.dbg(33);
             self.is_def_eq(at, dom)
         }
     }
@@ -1766,6 +1862,7 @@ impl<'e> Checker<'e> {
             if dt != ds {
                 let st = self.store.instantiate(ds, &subst);
                 let tt = self.store.instantiate(dt, &subst);
+                self.dbg(29);
                 if !self.is_def_eq(tt, st)? {
                     return Ok(false);
                 }
@@ -1789,6 +1886,7 @@ impl<'e> Checker<'e> {
         }
         let ti = self.store.instantiate(t, &subst);
         let si = self.store.instantiate(s, &subst);
+        self.dbg(30);
         self.is_def_eq(ti, si)
     }
 
@@ -1797,6 +1895,7 @@ impl<'e> Checker<'e> {
         loop {
             match (self.store.get(t), self.store.get(s)) {
                 (Term::App(f1, a1), Term::App(f2, a2)) => {
+                    self.dbg(25);
                     if !self.is_def_eq(a1, a2)? {
                         return Ok(false);
                     }
@@ -1819,6 +1918,7 @@ impl<'e> Checker<'e> {
         let b0 = self.store.mk_bvar(0);
         let app = self.store.mk_app(s, b0);
         let new_s = self.store.mk_lam(d, app);
+        self.dbg(31);
         self.is_def_eq(t, new_s)
     }
 
@@ -1837,6 +1937,7 @@ impl<'e> Checker<'e> {
         }
         let tt = self.infer(t, false)?;
         let mut s_type = self.infer(s, false)?;
+        self.dbg(26);
         if !self.is_def_eq(tt, s_type)? {
             return Ok(false);
         }
@@ -1863,6 +1964,7 @@ impl<'e> Checker<'e> {
         let np = sc.num_params as usize;
         for i in np..s_args.len() {
             let proj = self.store.mk_proj(sc.induct, (i - np) as u32, t);
+            self.dbg(27);
             if !self.is_def_eq(proj, s_args[i])? {
                 return Ok(false);
             }
@@ -1882,10 +1984,12 @@ impl<'e> Checker<'e> {
         let tf = self.store.unfold_app(t, &mut ta);
         let mut sa = Vec::new();
         let sf = self.store.unfold_app(s, &mut sa);
+        self.dbg(28);
         if !self.is_def_eq(tf, sf)? || ta.len() != sa.len() {
             return Ok(false);
         }
         for i in 0..ta.len() {
+            self.dbg(28);
             if !self.is_def_eq(ta[i], sa[i])? {
                 return Ok(false);
             }
@@ -1901,6 +2005,7 @@ impl<'e> Checker<'e> {
         }
         self.dbg(5);
         let st = self.infer(s, false)?;
+        self.dbg(32);
         Ok(Some(self.is_def_eq(tt, st)?))
     }
 
@@ -2005,6 +2110,7 @@ impl<'e> Checker<'e> {
         let pt = self.is_nat_succ(t);
         let ps = self.is_nat_succ(s);
         if let (Some(a), Some(b)) = (pt, ps) {
+            self.dbg(38);
             return Ok(Some(self.is_def_eq_core(a, b)?));
         }
         Ok(None)
@@ -2047,8 +2153,10 @@ impl<'e> Checker<'e> {
             let no_locals = self.store.local_ub(*tn) == 0 && self.store.local_ub(*sn) == 0;
             if no_locals || self.eager_reduce {
                 if let Some(tv) = self.reduce_nat(*tn)? {
+                    self.dbg(37);
                     return Ok(Some(self.is_def_eq_core(tv, *sn)?));
                 } else if let Some(sv) = self.reduce_nat(*sn)? {
+                    self.dbg(37);
                     return Ok(Some(self.is_def_eq_core(*tn, sv)?));
                 }
             }
@@ -2069,9 +2177,11 @@ impl<'e> Checker<'e> {
                 Status::DefUnknown | Status::DefDiff => {
                     if let Some(t) = self.reduce_proj_core(*tc, sname, idx)? {
                         if let Some(s) = self.reduce_proj_core(*sc, sname, idx)? {
+                            self.dbg(36);
                             return self.is_def_eq_core(t, s);
                         }
                     }
+                    self.dbg(36);
                     return self.is_def_eq_core(*tc, *sc);
                 }
             }
@@ -2089,6 +2199,7 @@ impl<'e> Checker<'e> {
         }
         let k = self.string_lit_to_constructor(t)?;
         let w = self.whnf(k)?;
+        self.dbg(40);
         Ok(Some(self.is_def_eq_core(w, s)?))
     }
 
@@ -2143,6 +2254,7 @@ impl<'e> Checker<'e> {
             return Ok(false);
         }
         let st = self.infer(s, false)?;
+        self.dbg(39);
         self.is_def_eq_core(tt, st)
     }
 
@@ -2179,15 +2291,20 @@ impl<'e> Checker<'e> {
         if self.dbg_max.is_none() {
             return;
         }
-        const NAMES: [&str; 24] = [
+        const NAMES: [&str; 48] = [
             "is_def_eq", "success_hit", "failure_hit", "quick_eq", "quick_success", "proof_irrel_prop",
             "unfold_left_only", "unfold_right_only", "unfold_both", "hint_left", "hint_right", "args_shortcut",
             "args_shortcut_ok", "failed_before_hit", "def_eq_app_ok", "eta_expansion_ok", "eta_struct_ok", "unit_like_try",
             "whnf_core_defeq", "proof_irrel_infer", "binding", "lazy_delta_calls", "lazy_steps", "proj_lazy",
+            "-", "args_loop", "eta_struct_ty", "eta_struct_proj", "app_fn_args", "bind_dom", "bind_body", "eta_exp",
+            "pf_irrel_ty", "check_arg", "-", "tnn_rec", "proj_lazy_site", "nat_lazy", "offset", "unit_like_ty",
+            "string_exp", "-", "-", "infer_closed_hit", "infer_closed_miss", "infer_open_hit", "infer_open_miss", "-",
         ];
         let mut line = String::from("defeq-counters:");
         for (i, n) in NAMES.iter().enumerate() {
-            line += &format!(" {}={}", n, self.dbg_cnt[i]);
+            if self.dbg_cnt[i] != 0 {
+                line += &format!(" {}={}", n, self.dbg_cnt[i]);
+            }
         }
         eprintln!("{line}");
         let mut v: Vec<(NameId, u64)> = self.dbg_unfold.drain().collect();
@@ -2195,7 +2312,7 @@ impl<'e> Checker<'e> {
         for (n, c) in v.into_iter().take(20) {
             eprintln!("  unfold {:>10} {}", c, self.env.raw.name_to_string(n));
         }
-        self.dbg_cnt = [0; 24];
+        self.dbg_cnt = [0; 48];
     }
 
     fn is_def_eq_core_inner(&mut self, t: TermId, s: TermId) -> R<bool> {
@@ -2245,6 +2362,7 @@ impl<'e> Checker<'e> {
         let tnn = self.whnf_core(tn, false, false)?;
         let snn = self.whnf_core(sn, false, false)?;
         if tnn != tn || snn != sn {
+            self.dbg(35);
             return self.is_def_eq_core(tnn, snn);
         }
         if self.is_def_eq_app(tn, sn)? {
