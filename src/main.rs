@@ -10,6 +10,7 @@ use std::thread;
 
 use palladium::env::{Decl, Env, NameId};
 use palladium::parse::{self, LoadError};
+use palladium::parse_par;
 use palladium::tc::{Checker, Fail};
 
 const STACK_SIZES: [usize; 3] = [4 << 30, 1 << 30, 256 << 20];
@@ -19,21 +20,26 @@ const RESET_TERMS: usize = 3_000_000;
 struct Opts {
     jobs: Option<usize>,
     quiet: bool,
+    parse_only: bool,
+    /// Uses the sequential reference loader (for benchmarks).
+    sequential: bool,
     input: String,
 }
 
 fn usage() -> ! {
-    eprintln!("usage: palladium [-j N] [-q] <file | ->");
+    eprintln!("usage: palladium [-j N] [-q] [--parse-only] <file | ->");
     process::exit(4)
 }
 
 fn parse_args() -> Opts {
-    let mut opts = Opts { jobs: None, quiet: false, input: String::new() };
+    let mut opts = Opts { jobs: None, quiet: false, parse_only: false, sequential: false, input: String::new() };
     let mut args = std::env::args().skip(1);
     let mut have_input = false;
     while let Some(a) = args.next() {
         match a.as_str() {
             "-q" => opts.quiet = true,
+            "--parse-only" => opts.parse_only = true,
+            "--sequential" => opts.sequential = true,
             "-j" => match args.next().and_then(|n| n.parse::<usize>().ok()) {
                 Some(n) if n >= 1 => opts.jobs = Some(n),
                 _ => usage(),
@@ -123,6 +129,18 @@ fn worker(env: &Env, counter: &AtomicUsize, fault: &Mutex<Option<String>>, total
     }
 }
 
+/// Peak resident set size (VmHWM) in KiB, or 0 when unavailable.
+fn peak_rss_kib() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("VmHWM:"))
+                .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+        })
+        .unwrap_or(0)
+}
+
 fn main() {
     panic::set_hook(Box::new(|_| {}));
     let opts = parse_args();
@@ -142,7 +160,21 @@ fn main() {
             }
         }
     };
-    let env = match parse::load(&bytes) {
+    let jobs = opts
+        .jobs
+        .unwrap_or_else(|| thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(8))
+        .max(1);
+    let trace = std::env::var_os("PALLADIUM_TRACE").is_some();
+    let t_parse = std::time::Instant::now();
+    let loaded = if opts.sequential {
+        parse::load(&bytes)
+    } else {
+        parse_par::load_parallel(&bytes, jobs)
+    };
+    if trace {
+        eprintln!("trace: read+parse+env {:.3}s, {} bytes, {} threads", t_parse.elapsed().as_secs_f64(), bytes.len(), jobs);
+    }
+    let env = match loaded {
         Ok(e) => e,
         Err(LoadError::Reject(m)) => {
             eprintln!("rejected: {m}");
@@ -153,12 +185,18 @@ fn main() {
             process::exit(2);
         }
     };
+    // The file bytes are not needed past this point.
     drop(bytes);
+    if trace {
+        eprintln!("trace: peak RSS after load {}", peak_rss_kib());
+    }
+    if opts.parse_only {
+        if !opts.quiet {
+            println!("parsed: {} declarations, {} exprs", env.raw.decls.len(), env.raw.exprs.len());
+        }
+        process::exit(0);
+    }
     let total = env.raw.decls.len();
-    let jobs = opts
-        .jobs
-        .unwrap_or_else(|| thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(8))
-        .max(1);
     let counter = AtomicUsize::new(0);
     let fault: Mutex<Option<String>> = Mutex::new(None);
     let env_ref = &env;

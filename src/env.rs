@@ -5,6 +5,7 @@
 //! (indexed by `NameId`) and the resolved builtin names.
 
 use std::collections::HashMap;
+use std::hash::BuildHasherDefault;
 
 use crate::bignat::BigNat;
 
@@ -175,12 +176,30 @@ pub struct RawEnv {
     /// One entry per declaration line, in file order. The index is the position.
     pub decls: Vec<Decl>,
     /// Name hash -> most recently interned name with that hash.
-    name_head: HashMap<u64, NameId>,
+    name_head: HashMap<u64, NameId, BuildHasherDefault<HashPass>>,
     /// Per name: the next older name with the same hash (`NONE` ends the chain).
     name_next: Vec<NameId>,
 }
 
 const NONE: NameId = u32::MAX;
+
+/// Hasher for keys that are already 64-bit hashes: one multiplication, no SipHash.
+#[derive(Default)]
+pub struct HashPass(u64);
+
+impl std::hash::Hasher for HashPass {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0.rotate_left(8) ^ b as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+    }
+    fn write_u64(&mut self, n: u64) {
+        self.0 = n.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+}
 
 fn name_hash(prefix: NameId, kind: u8, payload: &[u8]) -> u64 {
     let p = prefix.to_le_bytes();
@@ -201,7 +220,7 @@ impl RawEnv {
             nats: Vec::new(),
             strs: Vec::new(),
             decls: Vec::new(),
-            name_head: HashMap::new(),
+            name_head: HashMap::default(),
             name_next: vec![NONE],
         }
     }
@@ -265,6 +284,13 @@ impl RawEnv {
             cur = *self.name_next.get(cur as usize)?;
         }
         None
+    }
+
+    /// Reserves room for `n` more names.
+    pub(crate) fn reserve_names(&mut self, n: usize) {
+        self.names.reserve(n);
+        self.name_next.reserve(n);
+        self.name_head.reserve(n);
     }
 
     /// Interns `prefix.comp`. Returns the id and whether it was newly created.
