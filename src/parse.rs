@@ -5,6 +5,11 @@
 //! maps them to dense internal ids. It keeps the identity mapping while the
 //! file is dense and switches to a hash map on the first out-of-order or
 //! aliased index.
+//!
+//! The line grammar is written once, against the `Sink` trait. `Loader` is the
+//! sequential reference (`load`). `parse_par` runs the same grammar on chunks
+//! of the file with a `Sink` that cannot intern names and falls back whenever
+//! it sees anything it cannot merge exactly.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -47,9 +52,9 @@ impl LoadError {
     }
 }
 
-type LResult<T> = Result<T, LoadError>;
+pub(crate) type LResult<T> = Result<T, LoadError>;
 
-fn reject<T>(msg: impl Into<String>) -> LResult<T> {
+pub(crate) fn reject<T>(msg: impl Into<String>) -> LResult<T> {
     Err(LoadError::Reject(msg.into()))
 }
 
@@ -65,7 +70,7 @@ fn put<T>(slot: &mut Option<T>, v: T, what: &str) -> LResult<()> {
     Ok(())
 }
 
-fn to_u32(v: usize, what: &str) -> LResult<u32> {
+pub(crate) fn to_u32(v: usize, what: &str) -> LResult<u32> {
     u32::try_from(v).or_else(|_| reject(format!("too many {what}")))
 }
 
@@ -82,11 +87,7 @@ fn sat_u32(v: u64) -> u32 {
     u32::try_from(v).unwrap_or(u32::MAX)
 }
 
-fn parse_nat(s: &[u8]) -> Option<BigNat> {
-    BigNat::from_decimal(s)
-}
-
-fn trim(l: &[u8]) -> &[u8] {
+pub(crate) fn trim(l: &[u8]) -> &[u8] {
     l.trim_ascii()
 }
 
@@ -141,11 +142,12 @@ impl IdxTable {
     }
 }
 
+/// The three index namespaces. The discriminant selects per-namespace state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Ns {
-    Name,
-    Level,
-    Expr,
+pub(crate) enum Ns {
+    Name = 0,
+    Level = 1,
+    Expr = 2,
 }
 
 /// Fields of every object that can appear as a declaration or a nested
@@ -176,7 +178,36 @@ struct Fields {
     k: Option<bool>,
 }
 
-struct Loader {
+/// Operations the line grammar needs from its consumer.
+///
+/// Reference methods return the internal id of an already defined item and
+/// reject when the item is not defined yet. `define` is called once per item
+/// line with the id the matching `push_*` returned.
+pub(crate) trait Sink {
+    /// Scratch buffer for decoded strings.
+    fn scratch(&mut self) -> &mut Vec<u8>;
+    fn name_ref(&mut self, idx: u64) -> LResult<NameId>;
+    fn level_ref(&mut self, idx: u64) -> LResult<RawLevel>;
+    fn expr_ref(&mut self, idx: u64) -> LResult<RawExpr>;
+    /// Interns `pre.s` where `s` is the scratch buffer (validated as UTF-8).
+    fn str_name(&mut self, pre: NameId) -> LResult<(NameId, bool)>;
+    fn num_name(&mut self, pre: NameId, n: u64) -> LResult<(NameId, bool)>;
+    /// Adds the string literal held in the scratch buffer and returns its index.
+    fn str_lit(&mut self) -> LResult<u32>;
+    fn push_level(&mut self, node: RawLevelNode) -> LResult<(RawLevel, bool)>;
+    fn push_expr(&mut self, node: RawNode) -> LResult<(RawExpr, bool)>;
+    fn push_nat(&mut self, n: BigNat) -> LResult<u32>;
+    fn const_levels_len(&self) -> usize;
+    fn push_const_level(&mut self, l: RawLevel) -> LResult<()>;
+    fn decl_count(&self) -> usize;
+    fn push_decl(&mut self, d: Decl) -> LResult<()>;
+    fn declare(&mut self, name: NameId, info: ConstInfo) -> LResult<()>;
+    /// Records that item `idx` of namespace `ns` is the node `id`.
+    fn define(&mut self, ns: Ns, idx: u64, id: u32, fresh: bool) -> LResult<()>;
+}
+
+/// The sequential reference loader.
+pub(crate) struct Loader {
     env: RawEnv,
     names_ix: IdxTable,
     levels_ix: IdxTable,
@@ -201,12 +232,12 @@ pub fn load(bytes: &[u8]) -> Result<Env, LoadError> {
     meta_line(first).map_err(|e| e.at_line(n0))?;
     let mut ld = Loader::new();
     for (n, line) in lines {
-        ld.item_line(line).map_err(|e| e.at_line(n))?;
+        item_line(&mut ld, line).map_err(|e| e.at_line(n))?;
     }
     ld.finish()
 }
 
-fn meta_line(line: &[u8]) -> LResult<()> {
+pub(crate) fn meta_line(line: &[u8]) -> LResult<()> {
     let mut c = Cursor::new(line);
     let mut version: Option<&[u8]> = None;
     let mut seen = false;
@@ -281,459 +312,105 @@ impl Loader {
         }
     }
 
-    fn name_ref(&self, idx: u64) -> LResult<NameId> {
+    fn finish(self) -> LResult<Env> {
+        let Loader { env, mut consts, .. } = self;
+        if consts.len() < env.names.len() {
+            consts.resize_with(env.names.len(), || None);
+        }
+        let builtins = Builtins::resolve(&env);
+        Ok(Env { raw: env, consts, builtins })
+    }
+}
+
+impl Sink for Loader {
+    fn scratch(&mut self) -> &mut Vec<u8> {
+        &mut self.scratch
+    }
+
+    fn name_ref(&mut self, idx: u64) -> LResult<NameId> {
         self.names_ix
             .lookup(idx)
             .ok_or_else(|| LoadError::Reject(format!("reference to undefined name index {idx}")))
     }
 
-    fn level_ref(&self, idx: u64) -> LResult<RawLevel> {
+    fn level_ref(&mut self, idx: u64) -> LResult<RawLevel> {
         self.levels_ix
             .lookup(idx)
             .ok_or_else(|| LoadError::Reject(format!("reference to undefined level index {idx}")))
     }
 
-    fn expr_ref(&self, idx: u64) -> LResult<RawExpr> {
+    fn expr_ref(&mut self, idx: u64) -> LResult<RawExpr> {
         self.exprs_ix
             .lookup(idx)
             .ok_or_else(|| LoadError::Reject(format!("reference to undefined expression index {idx}")))
     }
 
-    fn read_name_ref(&self, c: &mut Cursor<'_>) -> LResult<NameId> {
-        let i = c.parse_u64()?;
-        self.name_ref(i)
+    fn str_name(&mut self, pre: NameId) -> LResult<(NameId, bool)> {
+        push_capacity(self.env.names.len(), "names")?;
+        let s = match std::str::from_utf8(&self.scratch) {
+            Ok(s) => s,
+            Err(_) => return reject("invalid UTF-8 in name"),
+        };
+        Ok(self.env.intern_str(pre, s))
     }
 
-    fn read_level_ref(&self, c: &mut Cursor<'_>) -> LResult<RawLevel> {
-        let i = c.parse_u64()?;
-        self.level_ref(i)
+    fn num_name(&mut self, pre: NameId, n: u64) -> LResult<(NameId, bool)> {
+        push_capacity(self.env.names.len(), "names")?;
+        Ok(self.env.intern_num(pre, n))
     }
 
-    fn read_expr_ref(&self, c: &mut Cursor<'_>) -> LResult<RawExpr> {
-        let i = c.parse_u64()?;
-        self.expr_ref(i)
+    fn str_lit(&mut self) -> LResult<u32> {
+        let s = match std::str::from_utf8(&self.scratch) {
+            Ok(s) => s,
+            Err(_) => return reject("invalid UTF-8 in strVal"),
+        };
+        if let Some(&i) = self.str_ix.get(s) {
+            return Ok(i);
+        }
+        push_capacity(self.env.strs.len(), "string literals")?;
+        let i = self.env.strs.len() as u32;
+        self.env.strs.push(s.to_owned());
+        self.str_ix.insert(s.to_owned(), i);
+        Ok(i)
     }
 
-    fn read_name_array(&self, c: &mut Cursor<'_>) -> LResult<Vec<NameId>> {
-        let mut v = Vec::new();
-        each_elem!(c, {
-            v.push(self.read_name_ref(c)?);
-        });
-        Ok(v)
-    }
-
-    fn push_expr(&mut self, node: RawNode) -> LResult<(u32, bool)> {
-        push_capacity(self.env.exprs.len(), "expressions")?;
-        let id = self.env.exprs.len() as u32;
-        self.env.exprs.push(node);
-        Ok((id, true))
-    }
-
-    fn push_level(&mut self, node: RawLevelNode) -> LResult<(u32, bool)> {
+    fn push_level(&mut self, node: RawLevelNode) -> LResult<(RawLevel, bool)> {
         push_capacity(self.env.levels.len(), "levels")?;
         let id = self.env.levels.len() as u32;
         self.env.levels.push(node);
         Ok((id, true))
     }
 
-    fn intern_num(&mut self, prefix: NameId, n: u64) -> LResult<(NameId, bool)> {
-        push_capacity(self.env.names.len(), "names")?;
-        Ok(self.env.intern_num(prefix, n))
+    fn push_expr(&mut self, node: RawNode) -> LResult<(RawExpr, bool)> {
+        push_capacity(self.env.exprs.len(), "expressions")?;
+        let id = self.env.exprs.len() as u32;
+        self.env.exprs.push(node);
+        Ok((id, true))
     }
 
-    /// Processes one item or declaration line.
-    fn item_line(&mut self, line: &[u8]) -> LResult<()> {
-        let mut c = Cursor::new(line);
-        let mut idx: Option<(Ns, u64)> = None;
-        let mut item: Option<(Ns, u32, bool)> = None;
-        let mut is_decl = false;
-        let mut payloads = 0u32;
-        if !c.obj_begin()? {
-            return reject("empty object");
-        }
-        loop {
-            let key = c.obj_key()?;
-            match key {
-                b"in" => put(&mut idx, (Ns::Name, c.parse_u64()?), "in")?,
-                b"il" => put(&mut idx, (Ns::Level, c.parse_u64()?), "il")?,
-                b"ie" => put(&mut idx, (Ns::Expr, c.parse_u64()?), "ie")?,
-                _ => {
-                    if !is_payload_key(key) {
-                        return Err(LoadError::Decline(format!(
-                            "unknown top-level key `{}`",
-                            String::from_utf8_lossy(key)
-                        )));
-                    }
-                    payloads += 1;
-                    if payloads > 1 {
-                        return reject("more than one payload key in one line");
-                    }
-                    match key {
-                        b"str" | b"num" => {
-                            let (id, fresh) = self.parse_name(key, &mut c)?;
-                            item = Some((Ns::Name, id, fresh));
-                        }
-                        b"succ" | b"max" | b"imax" | b"param" => {
-                            let (id, fresh) = self.parse_level(key, &mut c)?;
-                            item = Some((Ns::Level, id, fresh));
-                        }
-                        b"bvar" | b"sort" | b"const" | b"app" | b"lam" | b"forallE" | b"letE" | b"proj"
-                        | b"natVal" | b"strVal" | b"mdata" => {
-                            let (id, fresh) = self.parse_expr(key, &mut c)?;
-                            item = Some((Ns::Expr, id, fresh));
-                        }
-                        b"axiom" | b"def" | b"opaque" | b"thm" | b"quot" | b"inductive" => {
-                            self.parse_decl(key, &mut c)?;
-                            is_decl = true;
-                        }
-                        _ => return reject("unexpected payload key"),
-                    }
-                }
-            }
-            if !c.obj_more()? {
-                break;
-            }
-        }
-        if !c.at_end() {
-            return reject("trailing characters after object");
-        }
-        if is_decl {
-            if idx.is_some() {
-                return reject("index key on a declaration line");
-            }
-            return Ok(());
-        }
-        let (pns, id, fresh) = match item {
-            Some(x) => x,
-            None => return reject("line has no payload"),
-        };
-        let (ins, iv) = match idx {
-            Some(x) => x,
-            None => return reject("item line without an index key"),
-        };
-        if ins != pns {
-            return reject("index key does not match the payload kind");
-        }
-        if self.table(pns).lookup(iv).is_some() {
-            return reject(format!("index {iv} is defined twice"));
-        }
-        self.table_mut(pns).define(iv, id, fresh);
+    fn push_nat(&mut self, n: BigNat) -> LResult<u32> {
+        push_capacity(self.env.nats.len(), "nat literals")?;
+        let idx = self.env.nats.len() as u32;
+        self.env.nats.push(n);
+        Ok(idx)
+    }
+
+    fn const_levels_len(&self) -> usize {
+        self.env.const_levels.len()
+    }
+
+    fn push_const_level(&mut self, l: RawLevel) -> LResult<()> {
+        self.env.const_levels.push(l);
         Ok(())
     }
 
-    /// `{"pre": name, "str": string}` or `{"pre": name, "i": integer}`.
-    fn parse_name(&mut self, key: &[u8], c: &mut Cursor<'_>) -> LResult<(NameId, bool)> {
-        let is_num = key == b"num";
-        let mut pre = None;
-        let mut num = None;
-        let mut have_str = false;
-        each_key!(c, k => match k {
-            b"pre" => put(&mut pre, self.read_name_ref(c)?, "pre")?,
-            b"str" if !is_num => {
-                if have_str {
-                    return reject("duplicate field `str`");
-                }
-                have_str = true;
-                c.parse_string_into(&mut self.scratch)?;
-            }
-            b"i" if is_num => put(&mut num, c.parse_u64()?, "i")?,
-            _ => c.skip_value()?,
-        });
-        let pre = req(pre, "pre")?;
-        if is_num {
-            let n = req(num, "i")?;
-            self.intern_num(pre, n)
-        } else {
-            if !have_str {
-                return reject("missing required field `str`");
-            }
-            push_capacity(self.env.names.len(), "names")?;
-            let s = match std::str::from_utf8(&self.scratch) {
-                Ok(s) => s,
-                Err(_) => return reject("invalid UTF-8 in name"),
-            };
-            Ok(self.env.intern_str(pre, s))
-        }
+    fn decl_count(&self) -> usize {
+        self.env.decls.len()
     }
 
-    /// Level payloads: `succ` / `param` take an integer; `max` / `imax` take `[integer, integer]`.
-    fn parse_level(&mut self, key: &[u8], c: &mut Cursor<'_>) -> LResult<(u32, bool)> {
-        let node = match key {
-            b"succ" => RawLevelNode::Succ(self.read_level_ref(c)?),
-            b"param" => RawLevelNode::Param(self.read_name_ref(c)?),
-            _ => {
-                let [a, b] = read_u64_pair(c)?;
-                let (a, b) = (self.level_ref(a)?, self.level_ref(b)?);
-                if key == b"max" {
-                    RawLevelNode::Max(a, b)
-                } else {
-                    RawLevelNode::IMax(a, b)
-                }
-            }
-        };
-        self.push_level(node)
-    }
-
-    /// Expression payloads. `mdata` creates no node: it returns the inner expression's id with `fresh = false`.
-    fn parse_expr(&mut self, key: &[u8], c: &mut Cursor<'_>) -> LResult<(u32, bool)> {
-        let node = match key {
-            b"bvar" => RawNode { tag: RawTag::BVar, a: sat_u32(c.parse_u64()?), b: 0, c: 0 },
-            b"sort" => RawNode { tag: RawTag::Sort, a: self.read_level_ref(c)?, b: 0, c: 0 },
-            b"const" => return self.parse_const(c),
-            b"app" => {
-                let (mut f, mut a) = (None, None);
-                each_key!(c, k => match k {
-                    b"fn" => put(&mut f, self.read_expr_ref(c)?, "fn")?,
-                    b"arg" => put(&mut a, self.read_expr_ref(c)?, "arg")?,
-                    _ => c.skip_value()?,
-                });
-                RawNode { tag: RawTag::App, a: req(f, "fn")?, b: req(a, "arg")?, c: 0 }
-            }
-            b"lam" | b"forallE" => {
-                let (mut name, mut ty, mut body, mut bi) = (None, None, None, None);
-                each_key!(c, k => match k {
-                    b"name" => put(&mut name, self.read_name_ref(c)?, "name")?,
-                    b"type" => put(&mut ty, self.read_expr_ref(c)?, "type")?,
-                    b"body" => put(&mut body, self.read_expr_ref(c)?, "body")?,
-                    b"binderInfo" => {
-                        let s = c.parse_plain_string()?;
-                        if !matches!(s, b"default" | b"implicit" | b"strictImplicit" | b"instImplicit") {
-                            return reject("invalid binderInfo");
-                        }
-                        put(&mut bi, (), "binderInfo")?;
-                    }
-                    _ => c.skip_value()?,
-                });
-                let _ = req(name, "name")?;
-                let _ = req(bi, "binderInfo")?;
-                let tag = if key == b"lam" { RawTag::Lam } else { RawTag::Pi };
-                RawNode { tag, a: req(ty, "type")?, b: req(body, "body")?, c: 0 }
-            }
-            b"letE" => {
-                let (mut name, mut ty, mut val, mut body, mut nondep) = (None, None, None, None, None);
-                each_key!(c, k => match k {
-                    b"name" => put(&mut name, self.read_name_ref(c)?, "name")?,
-                    b"type" => put(&mut ty, self.read_expr_ref(c)?, "type")?,
-                    b"value" => put(&mut val, self.read_expr_ref(c)?, "value")?,
-                    b"body" => put(&mut body, self.read_expr_ref(c)?, "body")?,
-                    b"nondep" => put(&mut nondep, c.parse_bool()?, "nondep")?,
-                    _ => c.skip_value()?,
-                });
-                let _ = req(name, "name")?;
-                let _ = req(nondep, "nondep")?;
-                RawNode {
-                    tag: RawTag::Let,
-                    a: req(ty, "type")?,
-                    b: req(val, "value")?,
-                    c: req(body, "body")?,
-                }
-            }
-            b"proj" => {
-                let (mut tn, mut idx, mut s) = (None, None, None);
-                each_key!(c, k => match k {
-                    b"typeName" => put(&mut tn, self.read_name_ref(c)?, "typeName")?,
-                    b"idx" => put(&mut idx, sat_u32(c.parse_u64()?), "idx")?,
-                    b"struct" => put(&mut s, self.read_expr_ref(c)?, "struct")?,
-                    _ => c.skip_value()?,
-                });
-                RawNode {
-                    tag: RawTag::Proj,
-                    a: req(tn, "typeName")?,
-                    b: req(idx, "idx")?,
-                    c: req(s, "struct")?,
-                }
-            }
-            b"natVal" => {
-                let s = c.parse_plain_string()?;
-                let n = match parse_nat(s) {
-                    Some(n) => n,
-                    None => return reject("invalid or unsupported natVal"),
-                };
-                push_capacity(self.env.nats.len(), "nat literals")?;
-                let idx = self.env.nats.len() as u32;
-                self.env.nats.push(n);
-                RawNode { tag: RawTag::Nat, a: idx, b: 0, c: 0 }
-            }
-            b"strVal" => {
-                c.parse_string_into(&mut self.scratch)?;
-                let s = match std::str::from_utf8(&self.scratch) {
-                    Ok(s) => s,
-                    Err(_) => return reject("invalid UTF-8 in strVal"),
-                };
-                let idx = match self.str_ix.get(s) {
-                    Some(&i) => i,
-                    None => {
-                        push_capacity(self.env.strs.len(), "string literals")?;
-                        let i = self.env.strs.len() as u32;
-                        self.env.strs.push(s.to_owned());
-                        self.str_ix.insert(s.to_owned(), i);
-                        i
-                    }
-                };
-                RawNode { tag: RawTag::Str, a: idx, b: 0, c: 0 }
-            }
-            b"mdata" => {
-                let mut inner = None;
-                each_key!(c, k => match k {
-                    b"expr" => put(&mut inner, self.read_expr_ref(c)?, "expr")?,
-                    _ => c.skip_value()?,
-                });
-                return Ok((req(inner, "expr")?, false));
-            }
-            _ => return reject("unexpected expression key"),
-        };
-        self.push_expr(node)
-    }
-
-    /// `{"typeName": ..., "us": [level...], "name": ...}`: the levels go to `const_levels`.
-    fn parse_const(&mut self, c: &mut Cursor<'_>) -> LResult<(u32, bool)> {
-        let mut name = None;
-        let mut us: Option<(u32, u32)> = None;
-        each_key!(c, k => match k {
-            b"name" => put(&mut name, self.read_name_ref(c)?, "name")?,
-            b"us" => {
-                if us.is_some() {
-                    return reject("duplicate field `us`");
-                }
-                let off = self.env.const_levels.len();
-                let mut cnt = 0usize;
-                each_elem!(c, {
-                    let l = self.read_level_ref(c)?;
-                    self.env.const_levels.push(l);
-                    cnt += 1;
-                });
-                us = Some((to_u32(off, "constant level lists")?, to_u32(cnt, "constant levels")?));
-            }
-            _ => c.skip_value()?,
-        });
-        let (off, cnt) = req(us, "us")?;
-        let name = req(name, "name")?;
-        self.push_expr(RawNode { tag: RawTag::Const, a: name, b: off, c: cnt })
-    }
-
-    /// Declaration lines: `axiom`, `def`, `opaque`, `thm`, `quot`, `inductive`.
-    fn parse_decl(&mut self, key: &[u8], c: &mut Cursor<'_>) -> LResult<()> {
-        let pos = self.env.decls.len();
-        push_capacity(pos, "declarations")?;
-        let pos = pos as u32;
-        if key == b"inductive" {
-            return self.parse_inductive(pos, c);
-        }
-        let f = self.parse_fields(c)?;
-        let name = req(f.name, "name")?;
-        let level_params = req(f.level_params, "levelParams")?;
-        let ty = req(f.ty, "type")?;
-        let (kind, is_unsafe, decl) = match key {
-            b"axiom" => (ConstKind::Axiom, req(f.is_unsafe, "isUnsafe")?, Decl::Axiom { name }),
-            b"def" => {
-                let safety = req(f.safety, "safety")?;
-                let hints = req(f.hints, "hints")?;
-                let value = req(f.value, "value")?;
-                let all = req(f.all, "all")?;
-                (
-                    ConstKind::Def { value, hints, safety, all },
-                    safety != Safety::Safe,
-                    Decl::Def { name },
-                )
-            }
-            b"thm" => {
-                let value = req(f.value, "value")?;
-                let all = req(f.all, "all")?;
-                (ConstKind::Thm { value, all }, false, Decl::Thm { name })
-            }
-            b"opaque" => {
-                let value = req(f.value, "value")?;
-                let is_unsafe = req(f.is_unsafe, "isUnsafe")?;
-                let all = req(f.all, "all")?;
-                (ConstKind::Opaque { value, all }, is_unsafe, Decl::Opaque { name })
-            }
-            _ => (ConstKind::Quot(req(f.quot_kind, "kind")?), false, Decl::Quot { name }),
-        };
-        self.declare(name, ConstInfo { pos, level_params, ty, kind, is_unsafe })?;
-        self.env.decls.push(decl);
+    fn push_decl(&mut self, d: Decl) -> LResult<()> {
+        self.env.decls.push(d);
         Ok(())
-    }
-
-    /// `{"types": [...], "ctors": [...], "recs": [...]}`. Each element is a constant record.
-    fn parse_inductive(&mut self, pos: u32, c: &mut Cursor<'_>) -> LResult<()> {
-        let mut types = Vec::new();
-        let mut ctors = Vec::new();
-        let mut recs = Vec::new();
-        each_key!(c, k => match k {
-            b"types" => each_elem!(c, {
-                let f = self.parse_fields(c)?;
-                let (n, info) = induct_const(f, pos)?;
-                self.declare(n, info)?;
-                types.push(n);
-            }),
-            b"ctors" => each_elem!(c, {
-                let f = self.parse_fields(c)?;
-                let (n, info) = ctor_const(f, pos)?;
-                self.declare(n, info)?;
-                ctors.push(n);
-            }),
-            b"recs" => each_elem!(c, {
-                let f = self.parse_fields(c)?;
-                let (n, info) = rec_const(f, pos)?;
-                self.declare(n, info)?;
-                recs.push(n);
-            }),
-            _ => c.skip_value()?,
-        });
-        self.env.decls.push(Decl::Inductive { types, ctors, recs });
-        Ok(())
-    }
-
-    /// Reads any object of constant fields. Unknown keys are skipped.
-    fn parse_fields(&mut self, c: &mut Cursor<'_>) -> LResult<Fields> {
-        let mut f = Fields::default();
-        each_key!(c, k => match k {
-            b"name" => put(&mut f.name, self.read_name_ref(c)?, "name")?,
-            b"levelParams" => put(&mut f.level_params, self.read_name_array(c)?, "levelParams")?,
-            b"type" => put(&mut f.ty, self.read_expr_ref(c)?, "type")?,
-            b"value" => put(&mut f.value, self.read_expr_ref(c)?, "value")?,
-            b"isUnsafe" => put(&mut f.is_unsafe, c.parse_bool()?, "isUnsafe")?,
-            b"hints" => put(&mut f.hints, parse_hints(c)?, "hints")?,
-            b"safety" => put(&mut f.safety, parse_safety(c)?, "safety")?,
-            b"all" => put(&mut f.all, self.read_name_array(c)?, "all")?,
-            b"kind" => put(&mut f.quot_kind, parse_quot_kind(c)?, "kind")?,
-            b"numParams" => put(&mut f.num_params, read_u32(c)?, "numParams")?,
-            b"numIndices" => put(&mut f.num_indices, read_u32(c)?, "numIndices")?,
-            b"ctors" => put(&mut f.ctors, self.read_name_array(c)?, "ctors")?,
-            b"numNested" => put(&mut f.num_nested, read_u32(c)?, "numNested")?,
-            b"isRec" => put(&mut f.is_rec, c.parse_bool()?, "isRec")?,
-            b"isReflexive" => put(&mut f.is_reflexive, c.parse_bool()?, "isReflexive")?,
-            b"induct" => put(&mut f.induct, self.read_name_ref(c)?, "induct")?,
-            b"cidx" => put(&mut f.cidx, read_u32(c)?, "cidx")?,
-            b"numFields" => put(&mut f.num_fields, read_u32(c)?, "numFields")?,
-            b"numMotives" => put(&mut f.num_motives, read_u32(c)?, "numMotives")?,
-            b"numMinors" => put(&mut f.num_minors, read_u32(c)?, "numMinors")?,
-            b"rules" => {
-                let mut v = Vec::new();
-                each_elem!(c, {
-                    v.push(self.parse_rule(c)?);
-                });
-                put(&mut f.rules, v, "rules")?;
-            }
-            b"k" => put(&mut f.k, c.parse_bool()?, "k")?,
-            _ => c.skip_value()?,
-        });
-        Ok(f)
-    }
-
-    fn parse_rule(&self, c: &mut Cursor<'_>) -> LResult<RecRule> {
-        let (mut ctor, mut nfields, mut rhs) = (None, None, None);
-        each_key!(c, k => match k {
-            b"ctor" => put(&mut ctor, self.read_name_ref(c)?, "ctor")?,
-            b"nfields" => put(&mut nfields, read_u32(c)?, "nfields")?,
-            b"rhs" => put(&mut rhs, self.read_expr_ref(c)?, "rhs")?,
-            _ => c.skip_value()?,
-        });
-        Ok(RecRule {
-            ctor: req(ctor, "ctor")?,
-            nfields: req(nfields, "nfields")?,
-            rhs: req(rhs, "rhs")?,
-        })
     }
 
     /// Adds `name` to the constant table. A second declaration of the same name is a rejection.
@@ -749,14 +426,412 @@ impl Loader {
         Ok(())
     }
 
-    fn finish(self) -> LResult<Env> {
-        let Loader { env, mut consts, .. } = self;
-        if consts.len() < env.names.len() {
-            consts.resize_with(env.names.len(), || None);
+    fn define(&mut self, ns: Ns, idx: u64, id: u32, fresh: bool) -> LResult<()> {
+        if self.table(ns).lookup(idx).is_some() {
+            return reject(format!("index {idx} is defined twice"));
         }
-        let builtins = Builtins::resolve(&env);
-        Ok(Env { raw: env, consts, builtins })
+        self.table_mut(ns).define(idx, id, fresh);
+        Ok(())
     }
+}
+
+/// Reads and checks one line (item or declaration) into `s`.
+pub(crate) fn item_line<S: Sink>(s: &mut S, line: &[u8]) -> LResult<()> {
+    let mut c = Cursor::new(line);
+    let mut idx: Option<(Ns, u64)> = None;
+    let mut item: Option<(Ns, u32, bool)> = None;
+    let mut is_decl = false;
+    let mut payloads = 0u32;
+    if !c.obj_begin()? {
+        return reject("empty object");
+    }
+    loop {
+        let key = c.obj_key()?;
+        match key {
+            b"in" => put(&mut idx, (Ns::Name, c.parse_u64()?), "in")?,
+            b"il" => put(&mut idx, (Ns::Level, c.parse_u64()?), "il")?,
+            b"ie" => put(&mut idx, (Ns::Expr, c.parse_u64()?), "ie")?,
+            _ => {
+                if !is_payload_key(key) {
+                    return Err(LoadError::Decline(format!(
+                        "unknown top-level key `{}`",
+                        String::from_utf8_lossy(key)
+                    )));
+                }
+                payloads += 1;
+                if payloads > 1 {
+                    return reject("more than one payload key in one line");
+                }
+                match key {
+                    b"str" | b"num" => {
+                        let (id, fresh) = parse_name(s, key, &mut c)?;
+                        item = Some((Ns::Name, id, fresh));
+                    }
+                    b"succ" | b"max" | b"imax" | b"param" => {
+                        let (id, fresh) = parse_level(s, key, &mut c)?;
+                        item = Some((Ns::Level, id, fresh));
+                    }
+                    b"bvar" | b"sort" | b"const" | b"app" | b"lam" | b"forallE" | b"letE" | b"proj"
+                    | b"natVal" | b"strVal" | b"mdata" => {
+                        let (id, fresh) = parse_expr(s, key, &mut c)?;
+                        item = Some((Ns::Expr, id, fresh));
+                    }
+                    b"axiom" | b"def" | b"opaque" | b"thm" | b"quot" | b"inductive" => {
+                        parse_decl(s, key, &mut c)?;
+                        is_decl = true;
+                    }
+                    _ => return reject("unexpected payload key"),
+                }
+            }
+        }
+        if !c.obj_more()? {
+            break;
+        }
+    }
+    if !c.at_end() {
+        return reject("trailing characters after object");
+    }
+    if is_decl {
+        if idx.is_some() {
+            return reject("index key on a declaration line");
+        }
+        return Ok(());
+    }
+    let (pns, id, fresh) = match item {
+        Some(x) => x,
+        None => return reject("line has no payload"),
+    };
+    let (ins, iv) = match idx {
+        Some(x) => x,
+        None => return reject("item line without an index key"),
+    };
+    if ins != pns {
+        return reject("index key does not match the payload kind");
+    }
+    s.define(pns, iv, id, fresh)
+}
+
+/// `{"pre": name, "str": string}` or `{"pre": name, "i": integer}`.
+fn parse_name<S: Sink>(s: &mut S, key: &[u8], c: &mut Cursor<'_>) -> LResult<(NameId, bool)> {
+    let is_num = key == b"num";
+    let mut pre = None;
+    let mut num = None;
+    let mut have_str = false;
+    each_key!(c, k => match k {
+        b"pre" => {
+            let i = c.parse_u64()?;
+            put(&mut pre, s.name_ref(i)?, "pre")?
+        }
+        b"str" if !is_num => {
+            if have_str {
+                return reject("duplicate field `str`");
+            }
+            have_str = true;
+            c.parse_string_into(s.scratch())?;
+        }
+        b"i" if is_num => put(&mut num, c.parse_u64()?, "i")?,
+        _ => c.skip_value()?,
+    });
+    let pre = req(pre, "pre")?;
+    if is_num {
+        let n = req(num, "i")?;
+        s.num_name(pre, n)
+    } else {
+        if !have_str {
+            return reject("missing required field `str`");
+        }
+        s.str_name(pre)
+    }
+}
+
+/// Level payloads: `succ` / `param` take an integer; `max` / `imax` take `[integer, integer]`.
+fn parse_level<S: Sink>(s: &mut S, key: &[u8], c: &mut Cursor<'_>) -> LResult<(RawLevel, bool)> {
+    let node = match key {
+        b"succ" => {
+            let i = c.parse_u64()?;
+            RawLevelNode::Succ(s.level_ref(i)?)
+        }
+        b"param" => {
+            let i = c.parse_u64()?;
+            RawLevelNode::Param(s.name_ref(i)?)
+        }
+        _ => {
+            let [a, b] = read_u64_pair(c)?;
+            let (a, b) = (s.level_ref(a)?, s.level_ref(b)?);
+            if key == b"max" {
+                RawLevelNode::Max(a, b)
+            } else {
+                RawLevelNode::IMax(a, b)
+            }
+        }
+    };
+    s.push_level(node)
+}
+
+fn read_name_ref<S: Sink>(s: &mut S, c: &mut Cursor<'_>) -> LResult<NameId> {
+    let i = c.parse_u64()?;
+    s.name_ref(i)
+}
+
+fn read_level_ref<S: Sink>(s: &mut S, c: &mut Cursor<'_>) -> LResult<RawLevel> {
+    let i = c.parse_u64()?;
+    s.level_ref(i)
+}
+
+fn read_expr_ref<S: Sink>(s: &mut S, c: &mut Cursor<'_>) -> LResult<RawExpr> {
+    let i = c.parse_u64()?;
+    s.expr_ref(i)
+}
+
+fn read_name_array<S: Sink>(s: &mut S, c: &mut Cursor<'_>) -> LResult<Vec<NameId>> {
+    let mut v = Vec::new();
+    each_elem!(c, {
+        v.push(read_name_ref(s, c)?);
+    });
+    Ok(v)
+}
+
+/// Expression payloads. `mdata` creates no node: it returns the inner expression's id with `fresh = false`.
+fn parse_expr<S: Sink>(s: &mut S, key: &[u8], c: &mut Cursor<'_>) -> LResult<(RawExpr, bool)> {
+    let node = match key {
+        b"bvar" => RawNode { tag: RawTag::BVar, a: sat_u32(c.parse_u64()?), b: 0, c: 0 },
+        b"sort" => RawNode { tag: RawTag::Sort, a: read_level_ref(s, c)?, b: 0, c: 0 },
+        b"const" => return parse_const(s, c),
+        b"app" => {
+            let (mut f, mut a) = (None, None);
+            each_key!(c, k => match k {
+                b"fn" => put(&mut f, read_expr_ref(s, c)?, "fn")?,
+                b"arg" => put(&mut a, read_expr_ref(s, c)?, "arg")?,
+                _ => c.skip_value()?,
+            });
+            RawNode { tag: RawTag::App, a: req(f, "fn")?, b: req(a, "arg")?, c: 0 }
+        }
+        b"lam" | b"forallE" => {
+            let (mut name, mut ty, mut body, mut bi) = (None, None, None, None);
+            each_key!(c, k => match k {
+                b"name" => put(&mut name, read_name_ref(s, c)?, "name")?,
+                b"type" => put(&mut ty, read_expr_ref(s, c)?, "type")?,
+                b"body" => put(&mut body, read_expr_ref(s, c)?, "body")?,
+                b"binderInfo" => {
+                    let v = c.parse_plain_string()?;
+                    if !matches!(v, b"default" | b"implicit" | b"strictImplicit" | b"instImplicit") {
+                        return reject("invalid binderInfo");
+                    }
+                    put(&mut bi, (), "binderInfo")?;
+                }
+                _ => c.skip_value()?,
+            });
+            let _ = req(name, "name")?;
+            let _ = req(bi, "binderInfo")?;
+            let tag = if key == b"lam" { RawTag::Lam } else { RawTag::Pi };
+            RawNode { tag, a: req(ty, "type")?, b: req(body, "body")?, c: 0 }
+        }
+        b"letE" => {
+            let (mut name, mut ty, mut val, mut body, mut nondep) = (None, None, None, None, None);
+            each_key!(c, k => match k {
+                b"name" => put(&mut name, read_name_ref(s, c)?, "name")?,
+                b"type" => put(&mut ty, read_expr_ref(s, c)?, "type")?,
+                b"value" => put(&mut val, read_expr_ref(s, c)?, "value")?,
+                b"body" => put(&mut body, read_expr_ref(s, c)?, "body")?,
+                b"nondep" => put(&mut nondep, c.parse_bool()?, "nondep")?,
+                _ => c.skip_value()?,
+            });
+            let _ = req(name, "name")?;
+            let _ = req(nondep, "nondep")?;
+            RawNode {
+                tag: RawTag::Let,
+                a: req(ty, "type")?,
+                b: req(val, "value")?,
+                c: req(body, "body")?,
+            }
+        }
+        b"proj" => {
+            let (mut tn, mut idx, mut st) = (None, None, None);
+            each_key!(c, k => match k {
+                b"typeName" => put(&mut tn, read_name_ref(s, c)?, "typeName")?,
+                b"idx" => put(&mut idx, sat_u32(c.parse_u64()?), "idx")?,
+                b"struct" => put(&mut st, read_expr_ref(s, c)?, "struct")?,
+                _ => c.skip_value()?,
+            });
+            RawNode {
+                tag: RawTag::Proj,
+                a: req(tn, "typeName")?,
+                b: req(idx, "idx")?,
+                c: req(st, "struct")?,
+            }
+        }
+        b"natVal" => {
+            let v = c.parse_plain_string()?;
+            let n = match BigNat::from_decimal(v) {
+                Some(n) => n,
+                None => return reject("invalid or unsupported natVal"),
+            };
+            RawNode { tag: RawTag::Nat, a: s.push_nat(n)?, b: 0, c: 0 }
+        }
+        b"strVal" => {
+            c.parse_string_into(s.scratch())?;
+            RawNode { tag: RawTag::Str, a: s.str_lit()?, b: 0, c: 0 }
+        }
+        b"mdata" => {
+            let mut inner = None;
+            each_key!(c, k => match k {
+                b"expr" => put(&mut inner, read_expr_ref(s, c)?, "expr")?,
+                _ => c.skip_value()?,
+            });
+            return Ok((req(inner, "expr")?, false));
+        }
+        _ => return reject("unexpected expression key"),
+    };
+    s.push_expr(node)
+}
+
+/// `{"typeName": ..., "us": [level...], "name": ...}`: the levels go to `const_levels`.
+fn parse_const<S: Sink>(s: &mut S, c: &mut Cursor<'_>) -> LResult<(RawExpr, bool)> {
+    let mut name = None;
+    let mut us: Option<(u32, u32)> = None;
+    each_key!(c, k => match k {
+        b"name" => put(&mut name, read_name_ref(s, c)?, "name")?,
+        b"us" => {
+            if us.is_some() {
+                return reject("duplicate field `us`");
+            }
+            let off = s.const_levels_len();
+            let mut cnt = 0usize;
+            each_elem!(c, {
+                let l = read_level_ref(s, c)?;
+                s.push_const_level(l)?;
+                cnt += 1;
+            });
+            us = Some((to_u32(off, "constant level lists")?, to_u32(cnt, "constant levels")?));
+        }
+        _ => c.skip_value()?,
+    });
+    let (off, cnt) = req(us, "us")?;
+    let name = req(name, "name")?;
+    s.push_expr(RawNode { tag: RawTag::Const, a: name, b: off, c: cnt })
+}
+
+/// Declaration lines: `axiom`, `def`, `opaque`, `thm`, `quot`, `inductive`.
+fn parse_decl<S: Sink>(s: &mut S, key: &[u8], c: &mut Cursor<'_>) -> LResult<()> {
+    let pos = s.decl_count();
+    push_capacity(pos, "declarations")?;
+    let pos = pos as u32;
+    if key == b"inductive" {
+        return parse_inductive(s, pos, c);
+    }
+    let f = parse_fields(s, c)?;
+    let name = req(f.name, "name")?;
+    let level_params = req(f.level_params, "levelParams")?;
+    let ty = req(f.ty, "type")?;
+    let (kind, is_unsafe, decl) = match key {
+        b"axiom" => (ConstKind::Axiom, req(f.is_unsafe, "isUnsafe")?, Decl::Axiom { name }),
+        b"def" => {
+            let safety = req(f.safety, "safety")?;
+            let hints = req(f.hints, "hints")?;
+            let value = req(f.value, "value")?;
+            let all = req(f.all, "all")?;
+            (
+                ConstKind::Def { value, hints, safety, all },
+                safety != Safety::Safe,
+                Decl::Def { name },
+            )
+        }
+        b"thm" => {
+            let value = req(f.value, "value")?;
+            let all = req(f.all, "all")?;
+            (ConstKind::Thm { value, all }, false, Decl::Thm { name })
+        }
+        b"opaque" => {
+            let value = req(f.value, "value")?;
+            let is_unsafe = req(f.is_unsafe, "isUnsafe")?;
+            let all = req(f.all, "all")?;
+            (ConstKind::Opaque { value, all }, is_unsafe, Decl::Opaque { name })
+        }
+        _ => (ConstKind::Quot(req(f.quot_kind, "kind")?), false, Decl::Quot { name }),
+    };
+    s.declare(name, ConstInfo { pos, level_params, ty, kind, is_unsafe })?;
+    s.push_decl(decl)
+}
+
+/// `{"types": [...], "ctors": [...], "recs": [...]}`. Each element is a constant record.
+fn parse_inductive<S: Sink>(s: &mut S, pos: u32, c: &mut Cursor<'_>) -> LResult<()> {
+    let mut types = Vec::new();
+    let mut ctors = Vec::new();
+    let mut recs = Vec::new();
+    each_key!(c, k => match k {
+        b"types" => each_elem!(c, {
+            let f = parse_fields(s, c)?;
+            let (n, info) = induct_const(f, pos)?;
+            s.declare(n, info)?;
+            types.push(n);
+        }),
+        b"ctors" => each_elem!(c, {
+            let f = parse_fields(s, c)?;
+            let (n, info) = ctor_const(f, pos)?;
+            s.declare(n, info)?;
+            ctors.push(n);
+        }),
+        b"recs" => each_elem!(c, {
+            let f = parse_fields(s, c)?;
+            let (n, info) = rec_const(f, pos)?;
+            s.declare(n, info)?;
+            recs.push(n);
+        }),
+        _ => c.skip_value()?,
+    });
+    s.push_decl(Decl::Inductive { types, ctors, recs })
+}
+
+/// Reads any object of constant fields. Unknown keys are skipped.
+fn parse_fields<S: Sink>(s: &mut S, c: &mut Cursor<'_>) -> LResult<Fields> {
+    let mut f = Fields::default();
+    each_key!(c, k => match k {
+        b"name" => put(&mut f.name, read_name_ref(s, c)?, "name")?,
+        b"levelParams" => put(&mut f.level_params, read_name_array(s, c)?, "levelParams")?,
+        b"type" => put(&mut f.ty, read_expr_ref(s, c)?, "type")?,
+        b"value" => put(&mut f.value, read_expr_ref(s, c)?, "value")?,
+        b"isUnsafe" => put(&mut f.is_unsafe, c.parse_bool()?, "isUnsafe")?,
+        b"hints" => put(&mut f.hints, parse_hints(c)?, "hints")?,
+        b"safety" => put(&mut f.safety, parse_safety(c)?, "safety")?,
+        b"all" => put(&mut f.all, read_name_array(s, c)?, "all")?,
+        b"kind" => put(&mut f.quot_kind, parse_quot_kind(c)?, "kind")?,
+        b"numParams" => put(&mut f.num_params, read_u32(c)?, "numParams")?,
+        b"numIndices" => put(&mut f.num_indices, read_u32(c)?, "numIndices")?,
+        b"ctors" => put(&mut f.ctors, read_name_array(s, c)?, "ctors")?,
+        b"numNested" => put(&mut f.num_nested, read_u32(c)?, "numNested")?,
+        b"isRec" => put(&mut f.is_rec, c.parse_bool()?, "isRec")?,
+        b"isReflexive" => put(&mut f.is_reflexive, c.parse_bool()?, "isReflexive")?,
+        b"induct" => put(&mut f.induct, read_name_ref(s, c)?, "induct")?,
+        b"cidx" => put(&mut f.cidx, read_u32(c)?, "cidx")?,
+        b"numFields" => put(&mut f.num_fields, read_u32(c)?, "numFields")?,
+        b"numMotives" => put(&mut f.num_motives, read_u32(c)?, "numMotives")?,
+        b"numMinors" => put(&mut f.num_minors, read_u32(c)?, "numMinors")?,
+        b"rules" => {
+            let mut v = Vec::new();
+            each_elem!(c, {
+                v.push(parse_rule(s, c)?);
+            });
+            put(&mut f.rules, v, "rules")?;
+        }
+        b"k" => put(&mut f.k, c.parse_bool()?, "k")?,
+        _ => c.skip_value()?,
+    });
+    Ok(f)
+}
+
+fn parse_rule<S: Sink>(s: &mut S, c: &mut Cursor<'_>) -> LResult<RecRule> {
+    let (mut ctor, mut nfields, mut rhs) = (None, None, None);
+    each_key!(c, k => match k {
+        b"ctor" => put(&mut ctor, read_name_ref(s, c)?, "ctor")?,
+        b"nfields" => put(&mut nfields, read_u32(c)?, "nfields")?,
+        b"rhs" => put(&mut rhs, read_expr_ref(s, c)?, "rhs")?,
+        _ => c.skip_value()?,
+    });
+    Ok(RecRule {
+        ctor: req(ctor, "ctor")?,
+        nfields: req(nfields, "nfields")?,
+        rhs: req(rhs, "rhs")?,
+    })
 }
 
 fn induct_const(f: Fields, pos: u32) -> LResult<(NameId, ConstInfo)> {
