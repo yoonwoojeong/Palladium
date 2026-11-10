@@ -5,7 +5,7 @@
 use crate::bignat::BigNat;
 use crate::env::{ConstInfo, ConstKind, CtorInfo, Decl, Env, Hints, InductInfo, NameId, RawExpr, RawLevel, RawLevelNode, RawTag, RecInfo, Safety};
 use crate::store::{Level, LevelId, LevelsId, Store, Term, TermId};
-use crate::util::{DenseMap, FxHashMap, FxHashSet};
+use crate::util::{DenseMap, FxHashMap, FxHashSet, GenMap};
 
 #[derive(Debug)]
 pub enum Fail {
@@ -83,8 +83,11 @@ pub struct Checker<'e> {
     /// Operation counters for tracing: infer, whnf_core, whnf, is_def_eq_core, inductive_reduce_rec, rec-rule substitutions.
     pub stats: [u64; 6],
     depth: u32,
-    imp_expr: Vec<TermId>,
-    imp_level: Vec<LevelId>,
+    /// Diagnostics: file expression nodes imported (memo misses) since creation.
+    imp_count: u64,
+    /// Import memos (file index -> store id), generation-stamped and sized by what is live.
+    imp_expr: GenMap,
+    imp_level: GenMap,
     /// Reusable argument buffers (see `take_buf` / `give_buf`).
     buf_pool: Vec<Vec<TermId>>,
     infer_chk: DenseMap,
@@ -142,8 +145,9 @@ impl<'e> Checker<'e> {
             eager_reduce: false,
             stats: [0; 6],
             depth: 0,
-            imp_expr: Vec::new(),
-            imp_level: Vec::new(),
+            imp_count: 0,
+            imp_expr: GenMap::default(),
+            imp_level: GenMap::default(),
             buf_pool: Vec::new(),
             infer_chk: DenseMap::default(),
             infer_only: DenseMap::default(),
@@ -197,9 +201,7 @@ impl<'e> Checker<'e> {
     pub fn reset(&mut self) {
         self.store.clear();
         self.imp_expr.clear();
-        self.imp_expr.resize(self.env.raw.exprs.len(), 0);
         self.imp_level.clear();
-        self.imp_level.resize(self.env.raw.levels.len(), 0);
         self.infer_chk.clear();
         self.infer_only.clear();
         self.const_ty.clear();
@@ -263,8 +265,7 @@ impl<'e> Checker<'e> {
 
     /// Imports a file level (memoised).
     pub fn import_level(&mut self, l: RawLevel) -> LevelId {
-        let c = self.imp_level[l as usize];
-        if c != 0 {
+        if let Some(c) = self.imp_level.get(l) {
             return c;
         }
         let env = self.env;
@@ -286,14 +287,13 @@ impl<'e> Checker<'e> {
             }
             RawLevelNode::Param(n) => self.store.mk_param(n),
         };
-        self.imp_level[l as usize] = r;
+        self.imp_level.insert(l, r);
         r
     }
 
     /// Imports a file expression (memoised on every node).
     pub fn import_expr(&mut self, e: RawExpr) -> TermId {
-        let c = self.imp_expr[e as usize];
-        if c != 0 {
+        if let Some(c) = self.imp_expr.get(e) {
             return c;
         }
         let env = self.env;
@@ -341,8 +341,14 @@ impl<'e> Checker<'e> {
             RawTag::Nat => self.store.mk_nat(&env.raw.nats[n.a as usize]),
             RawTag::Str => self.store.mk_str(n.a),
         };
-        self.imp_expr[e as usize] = r;
+        self.imp_expr.insert(e, r);
+        self.imp_count += 1;
         r
+    }
+
+    /// Diagnostics: number of file expression nodes imported so far.
+    pub fn imported_nodes(&self) -> u64 {
+        self.imp_count
     }
 
     // ----- constants -------------------------------------------------------------

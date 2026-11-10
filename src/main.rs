@@ -83,10 +83,49 @@ fn decl_name(env: &Env, pos: usize) -> String {
     }
 }
 
+/// Per-thread accounting (`PALLADIUM_STATS=1`): printed once per worker at the end, so that
+/// measuring does not serialise the threads.
+#[derive(Default)]
+struct WStats {
+    decls: u64,
+    check_ns: u64,
+    reset_ns: u64,
+    resets: u64,
+    resets_terms: u64,
+    dbg_ns: u64,
+    loop_ns: u64,
+    imported: u64,
+}
+
+/// Process-wide (utime+stime in clock ticks, minflt, majflt) from /proc/self/stat, and this
+/// thread's (voluntary, involuntary) context switches from /proc/thread-self/status.
+fn thread_usage() -> (u64, u64, u64, u64, u64) {
+    let proc_stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+    let rest = proc_stat.rsplit(')').next().unwrap_or("");
+    // Tokens after the comm: index 0 is the state (field 3), so minflt(10)=7, majflt(12)=9, utime(14)=11, stime(15)=12.
+    let f: Vec<u64> = rest.split_whitespace().skip(1).map(|x| x.parse().unwrap_or(0)).collect();
+    let g = |i: usize| f.get(i).copied().unwrap_or(0);
+    let status = std::fs::read_to_string("/proc/thread-self/status").unwrap_or_default();
+    let cs = |key: &str| {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(key))
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    (g(10) + g(11), g(6), g(8), cs("voluntary_ctxt_switches:"), cs("nonvoluntary_ctxt_switches:"))
+}
+
 /// Checks declarations until the shared counter is exhausted.
 fn worker(env: &Env, counter: &AtomicUsize, fault: &Mutex<Option<String>>, total: usize) {
     let trace = std::env::var_os("PALLADIUM_TRACE").is_some();
+    let stats_on = std::env::var_os("PALLADIUM_STATS").is_some();
     let only_pos: Option<usize> = std::env::var("PALLADIUM_ONLY_POS").ok().and_then(|v| v.parse().ok());
+    // Diagnostics: `PALLADIUM_RESET_TERMS=<n>` overrides the store size that triggers a reset.
+    let reset_terms: usize = std::env::var("PALLADIUM_RESET_TERMS").ok().and_then(|v| v.parse().ok()).unwrap_or(RESET_TERMS);
+    let t_loop = std::time::Instant::now();
+    let u0 = thread_usage();
+    let mut ws = WStats::default();
     let mut checker = Checker::new(env);
     loop {
         let p = counter.fetch_add(1, Ordering::Relaxed);
@@ -98,9 +137,14 @@ fn worker(env: &Env, counter: &AtomicUsize, fault: &Mutex<Option<String>>, total
         if only_pos.map_or(false, |o| o != p) {
             continue;
         }
-        if checker.store.num_terms() > RESET_TERMS {
+        if checker.store.num_terms() > reset_terms {
+            let tr = std::time::Instant::now();
+            ws.resets_terms += checker.store.num_terms() as u64;
             checker.reset();
+            ws.reset_ns += tr.elapsed().as_nanos() as u64;
+            ws.resets += 1;
         }
+        ws.decls += 1;
         let t0 = trace.then(std::time::Instant::now);
         if trace {
             eprintln!("start: {} {}", p, decl_name(env, p));
@@ -113,9 +157,13 @@ fn worker(env: &Env, counter: &AtomicUsize, fault: &Mutex<Option<String>>, total
                 }
             }
         }
+        let tc0 = std::time::Instant::now();
         let res = panic::catch_unwind(AssertUnwindSafe(|| checker.check_decl(p as u32)));
+        ws.check_ns += tc0.elapsed().as_nanos() as u64;
         if trace {
+            let td = std::time::Instant::now();
             checker.dump_dbg();
+            ws.dbg_ns += td.elapsed().as_nanos() as u64;
         }
         if let Some(t0) = t0 {
             eprintln!("trace: {} {:.1}ms terms={} stats(infer,wcore,whnf,defeq,rec,rule)={:?}", decl_name(env, p), t0.elapsed().as_secs_f64() * 1e3, checker.store.num_terms(), checker.stats);
@@ -134,30 +182,52 @@ fn worker(env: &Env, counter: &AtomicUsize, fault: &Mutex<Option<String>>, total
                 *f = Some(msg);
             }
         }
+        let tr = std::time::Instant::now();
         checker = Checker::new(env);
+        ws.reset_ns += tr.elapsed().as_nanos() as u64;
+    }
+    if stats_on {
+        ws.loop_ns = t_loop.elapsed().as_nanos() as u64;
+        ws.imported = checker.imported_nodes();
+        let u1 = thread_usage();
+        eprintln!(
+            "stats: thread decls={} check={:.2}s reset={:.2}s resets={} avg_terms_at_reset={} loop={:.2}s dbg={:.2}s imported_nodes={} process_cpu_so_far={:.2}s process_minflt={} process_majflt={} thread_vcs={} thread_ivcs={}",
+            ws.decls,
+            ws.check_ns as f64 / 1e9,
+            ws.reset_ns as f64 / 1e9,
+            ws.resets,
+            ws.resets_terms / ws.resets.max(1),
+            ws.loop_ns as f64 / 1e9,
+            ws.dbg_ns as f64 / 1e9,
+            ws.imported,
+            u1.0 as f64 / 100.0,
+            u1.1 - u0.1,
+            u1.2 - u0.2,
+            u1.3 - u0.3,
+            u1.4 - u0.4
+        );
     }
 }
 
-/// A `kB` field of /proc/self/status, or 0 when unavailable.
-fn status_kib(field: &str) -> u64 {
+/// Peak resident set size (VmHWM) in KiB, or 0 when unavailable.
+fn peak_rss_kib() -> u64 {
+    rss_field("VmHWM:")
+}
+
+/// Current resident set size (VmRSS) in KiB, or 0 when unavailable.
+fn current_rss_kib() -> u64 {
+    rss_field("VmRSS:")
+}
+
+fn rss_field(key: &str) -> u64 {
     std::fs::read_to_string("/proc/self/status")
         .ok()
         .and_then(|s| {
             s.lines()
-                .find_map(|l| l.strip_prefix(field))
+                .find_map(|l| l.strip_prefix(key))
                 .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
         })
         .unwrap_or(0)
-}
-
-/// Peak resident set size (VmHWM) in KiB.
-fn peak_rss_kib() -> u64 {
-    status_kib("VmHWM:")
-}
-
-/// Current resident set size (VmRSS) in KiB.
-fn rss_kib() -> u64 {
-    status_kib("VmRSS:")
 }
 
 fn main() {
@@ -221,7 +291,7 @@ fn main() {
         }
     };
     if trace {
-        eprintln!("trace: peak RSS after load {} KiB, current RSS {} KiB", peak_rss_kib(), rss_kib());
+        eprintln!("trace: peak RSS after load {} KiB, current RSS {} KiB", peak_rss_kib(), current_rss_kib());
     }
     if opts.parse_only {
         if !opts.quiet {
