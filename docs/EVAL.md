@@ -78,12 +78,13 @@ terms `ctx: Vec<TermId>` (one per enclosing binder of the term being inferred: a
 * `App` → as before, but an argument is instantiated (`inst_ctx(a)`) only when the codomain really
   depends on it (`lbr(body) > 0`), and argument types come from `infer_ctx(a)`.
 * `Lam(ty, b)` → `dom = inst_ctx(ty)`; (check: `ensure_sort(infer_ctx(ty))`);
-  `x = mk_local(max(ctx_ub, local_ub(dom)), dom)`; push `x`; `B = infer_ctx(b)`; pop;
+  `x = mk_local(max(ctx_ub, local_ub(t), local_ub(dom)), dom)` where `t` is the whole binder term
+  (it is closed w.r.t. bvars only: it may itself mention locals, which the new one must not equal); push `x`; `B = infer_ctx(b)`; pop;
   result `Pi(dom, abstract_locals(B, [x]))`. `Pi` likewise → `Sort(imax(..))`.
 * `Let(ty, v, b)` → check `ty`, `v : ty`; push `inst_ctx(v)`; `infer_ctx(b)`; pop. No abstraction.
 * `Proj` → `infer(inst_ctx(t))` on the closed instance.
 `inst_ctx(t)` = `t` with bvar `i` ↦ `ctx[len-1-i]`, memoised on `(t, CtxId)` across calls, `t` itself if closed.
-Freshness: the new local's depth is ≥ `local_ub` of everything in the context and of its own type,
+Freshness: the new local's depth is ≥ `local_ub` of everything in the context, of the binder term and of its own type,
 so it cannot collide with any local that can appear in the instantiated body (design P2, invariant L).
 
 Oracle: `PALLADIUM_CHECK_INFER=1` compares against the old substitution-based `infer` up to
