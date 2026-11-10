@@ -108,6 +108,9 @@ fn worker(env: &Env, counter: &AtomicUsize, fault: &Mutex<Option<String>>, total
             }
         }
         let res = panic::catch_unwind(AssertUnwindSafe(|| checker.check_decl(p as u32)));
+        if trace {
+            checker.dump_dbg();
+        }
         if let Some(t0) = t0 {
             eprintln!("trace: {} {:.1}ms terms={} stats(infer,wcore,whnf,defeq,rec,rule)={:?}", decl_name(env, p), t0.elapsed().as_secs_f64() * 1e3, checker.store.num_terms(), checker.stats);
         }

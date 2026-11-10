@@ -95,8 +95,13 @@ pub struct Checker<'e> {
     unfold_c: FxHashMap<(NameId, LevelsId), TermId>,
     rule_c: FxHashMap<(NameId, LevelsId, u32), TermId>,
     nat_ok: FxHashMap<NameId, bool>,
-    success: FxHashSet<(TermId, TermId)>,
+    /// Union-find over `TermId` of proven def-eq successes (M6): `uf[t] == 0` means root.
+    uf: Vec<TermId>,
+    /// Final `false` results of `is_def_eq_core` (only when `eager_reduce` was off).
     failure: FxHashSet<(TermId, TermId)>,
+    /// Pairs whose same-head argument shortcut failed (`failed_before` of lazy delta).
+    /// Not a def-eq result: the pair may still be equal after unfolding.
+    shortcut_failure: FxHashSet<(TermId, TermId)>,
     /// Inference context of `infer_ctx`: closed entries, their interned prefix ids
     /// (`ctx_intern`, id 0 = empty), and the running max of their `local_ub`.
     ctx: Vec<TermId>,
@@ -114,6 +119,12 @@ pub struct Checker<'e> {
     /// `PALLADIUM_CHECK_INFER=1`: every top-level `infer` also runs `infer_subst` and compares.
     check_infer: bool,
     in_oracle: bool,
+    /// Diagnostics (`PALLADIUM_TRACE_DEFEQ=<max depth>`): def-eq tree printing and branch counters.
+    pub dbg_max: Option<u32>,
+    /// `PALLADIUM_TRACE_DEFEQ_POS=<decl position>`: restricts the def-eq tree to one declaration.
+    dbg_pos: Option<u32>,
+    pub dbg_cnt: [u64; 24],
+    pub dbg_unfold: FxHashMap<NameId, u64>,
 }
 
 impl<'e> Checker<'e> {
@@ -138,8 +149,9 @@ impl<'e> Checker<'e> {
             unfold_c: FxHashMap::default(),
             rule_c: FxHashMap::default(),
             nat_ok: FxHashMap::default(),
-            success: FxHashSet::default(),
+            uf: Vec::new(),
             failure: FxHashSet::default(),
+            shortcut_failure: FxHashSet::default(),
             ctx: Vec::new(),
             ctx_id: Vec::new(),
             ctx_ub: Vec::new(),
@@ -151,6 +163,10 @@ impl<'e> Checker<'e> {
             sub_only: DenseMap::default(),
             check_infer: std::env::var("PALLADIUM_CHECK_INFER").map_or(false, |v| v == "1"),
             in_oracle: false,
+            dbg_max: std::env::var("PALLADIUM_TRACE_DEFEQ").ok().and_then(|v| v.parse().ok()),
+            dbg_pos: std::env::var("PALLADIUM_TRACE_DEFEQ_POS").ok().and_then(|v| v.parse().ok()),
+            dbg_cnt: [0; 24],
+            dbg_unfold: FxHashMap::default(),
         };
         c.reset();
         c
@@ -201,8 +217,9 @@ impl<'e> Checker<'e> {
     pub fn clear_def_caches(&mut self) {
         self.whnf_core_c.clear();
         self.whnf_c.clear();
-        self.success.clear();
+        self.uf.clear();
         self.failure.clear();
+        self.shortcut_failure.clear();
     }
 
     /// Human-readable rendering of a term, depth-limited (for diagnostics).
@@ -386,6 +403,9 @@ impl<'e> Checker<'e> {
     fn unfold_definition_core(&mut self, e: TermId) -> R<Option<TermId>> {
         let Term::Const(n, ls) = self.store.get(e) else { return Ok(None) };
         let Some(info) = self.const_info_opt(n) else { return Ok(None) };
+        if self.dbg_max.is_some() {
+            *self.dbg_unfold.entry(n).or_insert(0) += 1;
+        }
         let value = match &info.kind {
             ConstKind::Def { value, .. } | ConstKind::Thm { value, .. } => *value,
             _ => return Ok(None),
@@ -1664,18 +1684,51 @@ impl<'e> Checker<'e> {
 
     /// `is_def_eq`: definitional equality of two closed terms.
     pub fn is_def_eq(&mut self, t: TermId, s: TermId) -> R<bool> {
+        self.dbg(0);
         let r = self.is_def_eq_core(t, s)?;
-        let key = ordered(t, s);
         if r {
-            self.success.insert(key);
+            self.uf_union(t, s);
         } else if !self.eager_reduce {
-            self.failure.insert(key);
+            self.failure.insert(ordered(t, s));
         }
         Ok(r)
     }
 
+    /// Root of `t` in the success union-find (path halving).
+    fn uf_find(&mut self, mut t: TermId) -> TermId {
+        loop {
+            let p = self.uf.get(t as usize).copied().unwrap_or(0);
+            if p == 0 {
+                return t;
+            }
+            let gp = self.uf.get(p as usize).copied().unwrap_or(0);
+            if gp == 0 {
+                return p;
+            }
+            self.uf[t as usize] = gp;
+            t = gp;
+        }
+    }
+
+    /// Records `t =?= s` as proven.
+    fn uf_union(&mut self, t: TermId, s: TermId) {
+        let (a, b) = (self.uf_find(t), self.uf_find(s));
+        if a != b {
+            let m = a.max(b) as usize;
+            if m >= self.uf.len() {
+                self.uf.resize(m + 1, 0);
+            }
+            self.uf[a.min(b) as usize] = a.max(b);
+        }
+    }
+
     fn quick_is_def_eq(&mut self, t: TermId, s: TermId) -> R<Option<bool>> {
-        if t == s || self.success.contains(&ordered(t, s)) {
+        if t == s {
+            self.dbg(3);
+            return Ok(Some(true));
+        }
+        if self.uf_find(t) == self.uf_find(s) {
+            self.dbg(4);
             return Ok(Some(true));
         }
         match (self.store.get(t), self.store.get(s)) {
@@ -1689,6 +1742,7 @@ impl<'e> Checker<'e> {
     }
 
     fn is_def_eq_binding(&mut self, t0: TermId, s0: TermId) -> R<bool> {
+        self.dbg(20);
         let k = self.store.get(t0);
         let same = |x: Term| std::mem::discriminant(&x) == std::mem::discriminant(&k);
         let base = self.store.local_ub(t0).max(self.store.local_ub(s0));
@@ -1840,20 +1894,26 @@ impl<'e> Checker<'e> {
     }
 
     fn is_def_eq_proof_irrel(&mut self, t: TermId, s: TermId) -> R<Option<bool>> {
+        self.dbg(19);
         let tt = self.infer(t, false)?;
         if !self.is_prop(tt)? {
             return Ok(None);
         }
+        self.dbg(5);
         let st = self.infer(s, false)?;
         Ok(Some(self.is_def_eq(tt, st)?))
     }
 
-    fn failed_before(&self, t: TermId, s: TermId) -> bool {
-        self.failure.contains(&ordered(t, s))
+    fn failed_before(&mut self, t: TermId, s: TermId) -> bool {
+        let r = self.shortcut_failure.contains(&ordered(t, s));
+        if r {
+            self.dbg(13);
+        }
+        r
     }
 
     fn cache_failure(&mut self, t: TermId, s: TermId) {
-        self.failure.insert(ordered(t, s));
+        self.shortcut_failure.insert(ordered(t, s));
     }
 
     fn try_unfold_proj_app(&mut self, e: TermId) -> R<Option<TermId>> {
@@ -1871,9 +1931,11 @@ impl<'e> Checker<'e> {
     pub(crate) fn lazy_delta_reduction_step(&mut self, tn: &mut TermId, sn: &mut TermId) -> R<Status> {
         let dt = self.is_delta(*tn);
         let ds = self.is_delta(*sn);
+        self.dbg(22);
         match (dt, ds) {
             (None, None) => return Ok(Status::DefUnknown),
             (Some(_), None) => {
+                self.dbg(6);
                 if let Some(s2) = self.try_unfold_proj_app(*sn)? {
                     *sn = s2;
                 } else {
@@ -1882,6 +1944,7 @@ impl<'e> Checker<'e> {
                 }
             }
             (None, Some(_)) => {
+                self.dbg(7);
                 if let Some(t2) = self.try_unfold_proj_app(*tn)? {
                     *tn = t2;
                 } else {
@@ -1891,6 +1954,7 @@ impl<'e> Checker<'e> {
             }
             (Some((nt, ht)), Some((ns, hs))) => {
                 let c = compare_hints(ht, hs);
+                self.dbg(if c < 0 { 9 } else if c > 0 { 10 } else { 8 });
                 if c < 0 {
                     let Some(u) = self.unfold_definition(*tn)? else { return Ok(Status::DefUnknown) };
                     *tn = self.whnf_core(u, false, true)?;
@@ -1913,7 +1977,9 @@ impl<'e> Checker<'e> {
                             _ => 0,
                         };
                         let (a, b) = (*tn, *sn);
+                        self.dbg(11);
                         if self.levels_eq(lt, ls) && self.is_def_eq_args(a, b)? {
+                            self.dbg(12);
                             return Ok(Status::DefEqual);
                         }
                         self.cache_failure(a, b);
@@ -1973,6 +2039,7 @@ impl<'e> Checker<'e> {
 
     /// `lazy_delta_reduction`: `None` means undetermined.
     fn lazy_delta_reduction(&mut self, tn: &mut TermId, sn: &mut TermId) -> R<Option<bool>> {
+        self.dbg(21);
         loop {
             if let Some(r) = self.is_def_eq_offset(*tn, *sn)? {
                 return Ok(Some(r));
@@ -2085,15 +2152,60 @@ impl<'e> Checker<'e> {
             self.depth -= 1;
             return fault("recursion depth exceeded");
         }
+        let print = self.dbg_max.map_or(false, |m| self.depth <= m) && self.dbg_pos.map_or(true, |p| p == self.pos);
+        if print {
+            let (a, b) = (self.show_depth(t, 6), self.show_depth(s, 6));
+            let tr = |x: String| x.chars().take(200).collect::<String>();
+            eprintln!("{:w$}{} =?= {}", "", tr(a), tr(b), w = self.depth as usize * 2);
+        }
         let r = self.is_def_eq_core_inner(t, s);
+        if print {
+            eprintln!("{:w$}=> {:?}", "", r.as_ref().ok(), w = self.depth as usize * 2);
+        }
         self.depth -= 1;
         r
+    }
+
+    /// Diagnostics: bumps branch counter `i` (no-op unless `PALLADIUM_TRACE_DEFEQ` is set).
+    #[inline]
+    fn dbg(&mut self, i: usize) {
+        if self.dbg_max.is_some() {
+            self.dbg_cnt[i] += 1;
+        }
+    }
+
+    /// Diagnostics: prints the branch counters and the top unfolded constants, then resets them.
+    pub fn dump_dbg(&mut self) {
+        if self.dbg_max.is_none() {
+            return;
+        }
+        const NAMES: [&str; 24] = [
+            "is_def_eq", "success_hit", "failure_hit", "quick_eq", "quick_success", "proof_irrel_prop",
+            "unfold_left_only", "unfold_right_only", "unfold_both", "hint_left", "hint_right", "args_shortcut",
+            "args_shortcut_ok", "failed_before_hit", "def_eq_app_ok", "eta_expansion_ok", "eta_struct_ok", "unit_like_try",
+            "whnf_core_defeq", "proof_irrel_infer", "binding", "lazy_delta_calls", "lazy_steps", "proj_lazy",
+        ];
+        let mut line = String::from("defeq-counters:");
+        for (i, n) in NAMES.iter().enumerate() {
+            line += &format!(" {}={}", n, self.dbg_cnt[i]);
+        }
+        eprintln!("{line}");
+        let mut v: Vec<(NameId, u64)> = self.dbg_unfold.drain().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        for (n, c) in v.into_iter().take(20) {
+            eprintln!("  unfold {:>10} {}", c, self.env.raw.name_to_string(n));
+        }
+        self.dbg_cnt = [0; 24];
     }
 
     fn is_def_eq_core_inner(&mut self, t: TermId, s: TermId) -> R<bool> {
         self.stats[3] += 1;
         if let Some(r) = self.quick_is_def_eq(t, s)? {
             return Ok(r);
+        }
+        if !self.eager_reduce && self.failure.contains(&ordered(t, s)) {
+            self.dbg(2);
+            return Ok(false);
         }
         if let Some(bt) = self.env.builtins.bool_true {
             let s_is_true = matches!(self.store.get(s), Term::Const(n, ls) if n == bt && self.store.levels(ls).is_empty());
@@ -2136,17 +2248,21 @@ impl<'e> Checker<'e> {
             return self.is_def_eq_core(tnn, snn);
         }
         if self.is_def_eq_app(tn, sn)? {
+            self.dbg(14);
             return Ok(true);
         }
         if self.try_eta_expansion(tn, sn)? {
+            self.dbg(15);
             return Ok(true);
         }
         if self.try_eta_struct(tn, sn)? {
+            self.dbg(16);
             return Ok(true);
         }
         if let Some(r) = self.try_string_lit_expansion(tn, sn)? {
             return Ok(r);
         }
+        self.dbg(17);
         if self.is_def_eq_unit_like(tn, sn)? {
             return Ok(true);
         }
