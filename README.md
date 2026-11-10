@@ -35,7 +35,9 @@ Debug switches: `PALLADIUM_TRACE=1` (per-declaration timings), `PALLADIUM_CHECK_
 ## Status
 
 Passes the arena's downloadable suite (all valid files accepted, all invalid files
-rejected). Not yet run against the large corpora (`Init`, `Std`, Mathlib).
+rejected) and accepts the `Init` (58k declarations, ~5 s) and `Std` (98k declarations, ~8 s)
+exports of Lean 4.34.1 on 4 threads. Not yet run against Mathlib. Reduction-heavy proofs
+(`decide` over large search spaces) are slow compared with environment-machine kernels.
 
 ## Arena checker definition
 
