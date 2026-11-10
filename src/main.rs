@@ -144,6 +144,8 @@ fn peak_rss_kib() -> u64 {
 fn main() {
     panic::set_hook(Box::new(|_| {}));
     let opts = parse_args();
+    let trace = std::env::var_os("PALLADIUM_TRACE").is_some();
+    let t_read = std::time::Instant::now();
     let bytes = if opts.input == "-" {
         let mut v = Vec::new();
         if let Err(e) = std::io::stdin().read_to_end(&mut v) {
@@ -164,7 +166,9 @@ fn main() {
         .jobs
         .unwrap_or_else(|| thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(8))
         .max(1);
-    let trace = std::env::var_os("PALLADIUM_TRACE").is_some();
+    if trace {
+        eprintln!("trace: read {:.3}s, {} bytes", t_read.elapsed().as_secs_f64(), bytes.len());
+    }
     let t_parse = std::time::Instant::now();
     let loaded = if opts.sequential {
         parse::load(&bytes)
@@ -172,7 +176,8 @@ fn main() {
         parse_par::load_parallel(&bytes, jobs)
     };
     if trace {
-        eprintln!("trace: read+parse+env {:.3}s, {} bytes, {} threads", t_parse.elapsed().as_secs_f64(), bytes.len(), jobs);
+        let mode = if opts.sequential { "sequential".to_string() } else { format!("{jobs} threads") };
+        eprintln!("trace: parse and env build {:.3}s ({mode})", t_parse.elapsed().as_secs_f64());
     }
     let env = match loaded {
         Ok(e) => e,
@@ -197,6 +202,7 @@ fn main() {
         process::exit(0);
     }
     let total = env.raw.decls.len();
+    let t_check = std::time::Instant::now();
     let counter = AtomicUsize::new(0);
     let fault: Mutex<Option<String>> = Mutex::new(None);
     let env_ref = &env;
@@ -224,6 +230,9 @@ fn main() {
     if let Some(msg) = fault.into_inner().ok().flatten() {
         eprintln!("fault: {msg}");
         process::exit(3);
+    }
+    if trace {
+        eprintln!("trace: check {:.3}s, peak RSS {} KiB", t_check.elapsed().as_secs_f64(), peak_rss_kib());
     }
     if !opts.quiet {
         println!("ok: {total} declarations");

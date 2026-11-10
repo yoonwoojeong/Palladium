@@ -91,6 +91,55 @@ pub(crate) fn trim(l: &[u8]) -> &[u8] {
     l.trim_ascii()
 }
 
+/// Position of the first `\n` in `s`, scanning eight bytes at a time.
+#[inline]
+pub(crate) fn find_newline(s: &[u8]) -> Option<usize> {
+    const LO: u64 = 0x0101_0101_0101_0101;
+    const HI: u64 = 0x8080_8080_8080_8080;
+    const NL: u64 = LO * b'\n' as u64;
+    let mut i = 0usize;
+    while i + 8 <= s.len() {
+        let mut w = [0u8; 8];
+        w.copy_from_slice(&s[i..i + 8]);
+        let x = u64::from_le_bytes(w) ^ NL;
+        // Non-zero iff some byte of `x` is zero; the lowest flagged byte is the first match.
+        let t = x.wrapping_sub(LO) & !x & HI;
+        if t != 0 {
+            return Some(i + (t.trailing_zeros() / 8) as usize);
+        }
+        i += 8;
+    }
+    s[i..].iter().position(|&b| b == b'\n').map(|p| i + p)
+}
+
+/// The segments of `buf` between newlines, like `split(|b| b == b'\n')`.
+pub(crate) struct Lines<'a> {
+    rest: Option<&'a [u8]>,
+}
+
+pub(crate) fn lines(buf: &[u8]) -> Lines<'_> {
+    Lines { rest: Some(buf) }
+}
+
+impl<'a> Iterator for Lines<'a> {
+    type Item = &'a [u8];
+
+    #[inline]
+    fn next(&mut self) -> Option<&'a [u8]> {
+        let rest = self.rest?;
+        match find_newline(rest) {
+            Some(p) => {
+                self.rest = Some(&rest[p + 1..]);
+                Some(&rest[..p])
+            }
+            None => {
+                self.rest = None;
+                Some(rest)
+            }
+        }
+    }
+}
+
 /// Keys that carry the payload of an item or declaration line.
 fn is_payload_key(key: &[u8]) -> bool {
     matches!(
@@ -220,8 +269,7 @@ pub(crate) struct Loader {
 
 /// Parses an export file.
 pub fn load(bytes: &[u8]) -> Result<Env, LoadError> {
-    let mut lines = bytes
-        .split(|&b| b == b'\n')
+    let mut lines = lines(bytes)
         .enumerate()
         .map(|(i, l)| (i + 1, trim(l)))
         .filter(|(_, l)| !l.is_empty());

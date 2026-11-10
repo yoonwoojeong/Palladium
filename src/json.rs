@@ -123,17 +123,23 @@ impl<'a> Cursor<'a> {
         self.skip_ws();
         let start = self.pos;
         let mut v: u64 = 0;
-        while let Some(&b) = self.buf.get(self.pos) {
-            if !b.is_ascii_digit() {
+        let mut i = start;
+        let buf = self.buf;
+        while i < buf.len() {
+            let d = buf[i].wrapping_sub(b'0');
+            if d > 9 {
                 break;
             }
-            let d = (b - b'0') as u64;
-            v = match v.checked_mul(10).and_then(|x| x.checked_add(d)) {
+            v = match v.checked_mul(10).and_then(|x| x.checked_add(d as u64)) {
                 Some(x) => x,
-                None => return self.err("integer does not fit in u64"),
+                None => {
+                    self.pos = i;
+                    return self.err("integer does not fit in u64");
+                }
             };
-            self.pos += 1;
+            i += 1;
         }
+        self.pos = i;
         if self.pos == start {
             return self.err("expected integer");
         }
@@ -164,27 +170,30 @@ impl<'a> Cursor<'a> {
         }
         let buf: &'a [u8] = self.buf;
         let start = self.pos + 1;
-        let mut i = start;
-        loop {
-            match buf.get(i) {
-                None => {
-                    self.pos = i;
-                    return self.err("unterminated string");
+        // Keys and names are short and almost always plain: one scan finds the end.
+        match buf[start..].iter().position(|&b| b == b'"' || b == b'\\' || b < 0x20) {
+            None => {
+                self.pos = buf.len();
+                self.err("unterminated string")
+            }
+            Some(r) => {
+                let i = start + r;
+                match buf[i] {
+                    b'"' => {
+                        self.pos = i + 1;
+                        Ok(&buf[start..i])
+                    }
+                    b'\\' => {
+                        self.pos = i;
+                        self.err("escape sequence not allowed here")
+                    }
+                    _ => {
+                        self.pos = i;
+                        self.err("control character in string")
+                    }
                 }
-                Some(b'"') => break,
-                Some(b'\\') => {
-                    self.pos = i;
-                    return self.err("escape sequence not allowed here");
-                }
-                Some(&b) if b < 0x20 => {
-                    self.pos = i;
-                    return self.err("control character in string");
-                }
-                Some(_) => i += 1,
             }
         }
-        self.pos = i + 1;
-        Ok(&buf[start..i])
     }
 
     /// Parses a string with full JSON decoding into UTF-8 bytes. `out` is

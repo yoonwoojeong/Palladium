@@ -6,22 +6,25 @@
 //! which records raw records and checks references under the assumption that
 //! the file is *dense*: the items of each index namespace carry consecutive
 //! indices, and a reference is valid when it names an item defined earlier.
-//! The merge verifies the density across chunks, interns names in file order
-//! (every name must be new), remaps the chunk-local string, nat and
-//! constant-level indices, and appends the vectors. A chunk that finds anything
-//! else (a reference it cannot resolve locally, an error, an alias from
-//! `mdata`, a duplicate name or constant) makes the whole parallel attempt
-//! fail, and the result is the sequential `load` of the same bytes. The
-//! outcome (Ok, Reject or Decline, with the same message) is therefore the
-//! sequential one by construction.
+//!
+//! Names are interned by one thread while the workers parse, in file order
+//! (their canonical ids must equal their file indices, so every name must be
+//! new). The merge then checks the density across chunks, remaps the
+//! chunk-local string, nat and constant-level indices, and fills the expression
+//! and level vectors in parallel. A chunk that finds anything else (a reference
+//! it cannot resolve locally, an error, an `mdata` alias, a duplicate name or
+//! constant) makes the whole parallel attempt fail, and the result is the
+//! sequential `load` of the same bytes. The outcome (Ok, Reject or Decline,
+//! with the same message) is therefore the sequential one by construction.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::thread;
 
 use crate::bignat::BigNat;
 use crate::env::*;
-use crate::parse::{item_line, load, meta_line, reject, trim, LResult, LoadError, Ns, Sink};
+use crate::parse::{find_newline, item_line, lines, load, meta_line, reject, trim, LResult, LoadError, Ns, Sink};
 
 /// Default chunk size in bytes.
 pub const CHUNK_BYTES: usize = 64 << 20;
@@ -52,7 +55,7 @@ fn try_parallel(bytes: &[u8], threads: usize, chunk_bytes: usize) -> Option<Env>
         if pos >= bytes.len() {
             return None;
         }
-        let end = bytes[pos..].iter().position(|&b| b == b'\n').map_or(bytes.len(), |p| pos + p);
+        let end = find_newline(&bytes[pos..]).map_or(bytes.len(), |p| pos + p);
         let line = trim(&bytes[pos..end]);
         if line.is_empty() {
             pos = end + 1;
@@ -64,12 +67,12 @@ fn try_parallel(bytes: &[u8], threads: usize, chunk_bytes: usize) -> Option<Env>
     let trace = std::env::var_os("PALLADIUM_TRACE").is_some();
     let t0 = std::time::Instant::now();
     let chunks = split_chunks(&bytes[body_start..], chunk_bytes);
-    let results = parse_all(&chunks, threads)?;
+    let (results, names) = parse_all(&chunks, threads, bytes.len())?;
     let t1 = t0.elapsed();
-    let env = merge(results, threads)?;
+    let env = merge(results, names, threads)?;
     if trace {
         eprintln!(
-            "trace: parallel: {} chunks, workers {:.3}s, merge {:.3}s",
+            "trace: parallel: {} chunks, parse and names {:.3}s, merge {:.3}s",
             chunks.len(),
             t1.as_secs_f64(),
             (t0.elapsed() - t1).as_secs_f64()
@@ -85,7 +88,7 @@ fn split_chunks(body: &[u8], chunk_bytes: usize) -> Vec<&[u8]> {
     while start < body.len() {
         let mut end = body.len().min(start.saturating_add(chunk_bytes));
         if end < body.len() {
-            end = match body[end..].iter().position(|&b| b == b'\n') {
+            end = match find_newline(&body[end..]) {
                 Some(p) => end + p + 1,
                 None => body.len(),
             };
@@ -96,26 +99,41 @@ fn split_chunks(body: &[u8], chunk_bytes: usize) -> Vec<&[u8]> {
     out
 }
 
-/// Parses every chunk on `threads` workers. `None` if any chunk fails or a worker panics.
-fn parse_all(chunks: &[&[u8]], threads: usize) -> Option<Vec<Chunk>> {
+/// Names of one chunk: prefixes, payloads and the bytes they point into.
+type NameBatch = (usize, Vec<WName>, Vec<u8>);
+
+/// Parses every chunk on `threads` workers while a further thread interns the
+/// names in file order. `None` if any chunk fails, a worker panics, or the
+/// names are not fresh.
+fn parse_all(chunks: &[&[u8]], threads: usize, file_len: usize) -> Option<(Vec<Chunk>, RawEnv)> {
     let next = AtomicUsize::new(0);
     let failed = AtomicBool::new(false);
     let workers = threads.min(chunks.len()).max(1);
-    let outs: Vec<Option<Vec<(usize, Chunk)>>> = thread::scope(|s| {
+    let (tx, rx) = mpsc::channel::<NameBatch>();
+    let (outs, names) = thread::scope(|s| {
+        let total = chunks.len();
+        let names_thread = s.spawn(move || intern_stream(rx, total, file_len));
         let handles: Vec<_> = (0..workers)
             .map(|_| {
-                s.spawn(|| {
+                let tx = tx.clone();
+                let (next, failed) = (&next, &failed);
+                s.spawn(move || {
                     let mut mine = Vec::new();
                     loop {
                         if failed.load(Ordering::Relaxed) {
                             break;
                         }
                         let i = next.fetch_add(1, Ordering::Relaxed);
-                        if i >= chunks.len() {
+                        if i >= total {
                             break;
                         }
                         match parse_chunk(chunks[i]) {
-                            Ok(c) => mine.push((i, c)),
+                            Ok(mut c) => {
+                                let names = std::mem::take(&mut c.names);
+                                let buf = std::mem::take(&mut c.names_buf);
+                                let _ = tx.send((i, names, buf));
+                                mine.push((i, c));
+                            }
                             Err(_) => {
                                 failed.store(true, Ordering::Relaxed);
                                 return None;
@@ -126,7 +144,9 @@ fn parse_all(chunks: &[&[u8]], threads: usize) -> Option<Vec<Chunk>> {
                 })
             })
             .collect();
-        handles.into_iter().map(|h| h.join().ok().flatten()).collect()
+        drop(tx);
+        let outs: Vec<Option<Vec<(usize, Chunk)>>> = handles.into_iter().map(|h| h.join().ok().flatten()).collect();
+        (outs, names_thread.join().ok().flatten())
     });
     if failed.load(Ordering::Relaxed) {
         return None;
@@ -137,12 +157,57 @@ fn parse_all(chunks: &[&[u8]], threads: usize) -> Option<Vec<Chunk>> {
             slots[i] = Some(c);
         }
     }
-    slots.into_iter().collect()
+    let chunks: Vec<Chunk> = slots.into_iter().collect::<Option<_>>()?;
+    Some((chunks, names?))
+}
+
+/// Interns name batches in file order as they arrive. Returns the name table
+/// when every batch was received and every name was new with the expected id.
+fn intern_stream(rx: mpsc::Receiver<NameBatch>, total: usize, file_len: usize) -> Option<RawEnv> {
+    let mut env = RawEnv::new();
+    env.reserve_names(file_len / 512);
+    let mut pending: BTreeMap<usize, (Vec<WName>, Vec<u8>)> = BTreeMap::new();
+    let mut next = 0usize;
+    // File index of the next name: names start after the predefined 0.
+    let mut first: u64 = 1;
+    let mut ok = true;
+    for (i, names, buf) in rx {
+        pending.insert(i, (names, buf));
+        while let Some((names, buf)) = pending.remove(&next) {
+            let count = names.len() as u64;
+            ok = ok && intern_batch(&mut env, names, &buf, first);
+            first += count;
+            next += 1;
+        }
+    }
+    (ok && next == total).then_some(env)
+}
+
+/// Interns the names of one chunk. The `j`-th name must be new and get file index `first + j`.
+fn intern_batch(env: &mut RawEnv, names: Vec<WName>, buf: &[u8], first: u64) -> bool {
+    for (j, w) in names.into_iter().enumerate() {
+        let (id, fresh) = match w {
+            WName::Str(p, off, len) => {
+                let Some(bytes) = buf.get(off as usize..off as usize + len as usize) else {
+                    return false;
+                };
+                let Ok(s) = std::str::from_utf8(bytes) else {
+                    return false;
+                };
+                env.intern_str(p, s)
+            }
+            WName::Num(p, n) => env.intern_num(p, n),
+        };
+        if !fresh || id as u64 != first + j as u64 {
+            return false;
+        }
+    }
+    true
 }
 
 fn parse_chunk(bytes: &[u8]) -> LResult<Chunk> {
     let mut ch = Chunk::default();
-    for line in bytes.split(|&b| b == b'\n') {
+    for line in lines(bytes) {
         let l = trim(line);
         if !l.is_empty() {
             item_line(&mut ch, l)?;
@@ -300,8 +365,7 @@ impl Sink for Chunk {
     }
 
     fn define(&mut self, ns: Ns, idx: u64, _id: u32, fresh: bool) -> LResult<()> {
-        // A non-fresh node (an `mdata` alias) or a name that is already interned
-        // needs the sequential index table.
+        // A non-fresh node (an `mdata` alias) needs the sequential index table.
         if !fresh {
             return reject("alias index");
         }
@@ -319,7 +383,7 @@ impl Sink for Chunk {
     }
 }
 
-/// Chunk output that the merge moves into the final vectors, remapping chunk-local indices.
+/// Chunk output that a fill job moves into the final vectors, remapping chunk-local indices.
 struct Fill<'a> {
     exprs: Vec<RawNode>,
     levels: Vec<RawLevelNode>,
@@ -347,20 +411,16 @@ fn fill(job: Fill<'_>) -> Option<()> {
 
 /// Appends the chunks in file order, checking density and remapping chunk-local indices.
 /// `None` means the file needs the sequential loader.
-fn merge(chunks: Vec<Chunk>, threads: usize) -> Option<Env> {
-    let mut env = RawEnv::new();
+fn merge(chunks: Vec<Chunk>, mut env: RawEnv, threads: usize) -> Option<Env> {
     let mut consts: Vec<Option<ConstInfo>> = Vec::new();
     let mut str_ix: HashMap<String, u32> = HashMap::new();
     // Next file index per namespace: names and levels start after the predefined 0.
     let mut base: [u64; 3] = [1, 1, 0];
-    // Expression and level nodes are placed by the parallel fill below.
-    let mut parts: Vec<(Vec<RawNode>, Vec<RawLevelNode>, Vec<u32>, u32, u32)> = Vec::with_capacity(chunks.len());
-    env.reserve_names(chunks.iter().map(|c| c.names.len()).sum());
+    let mut fills: Vec<(Vec<RawNode>, Vec<RawLevelNode>, Vec<u32>, u32, u32)> = Vec::with_capacity(chunks.len());
     // Level 0 (zero) is predefined.
     let (mut n_exprs, mut n_levels) = (0usize, 1usize);
     for ch in chunks {
-        let Chunk { ns, names_buf, names, levels, exprs, nats, strs, const_levels, decls, consts: cs, .. } = ch;
-        let start = base;
+        let Chunk { ns, levels, exprs, nats, strs, const_levels, decls, consts: cs, .. } = ch;
         for k in 0..3 {
             let st = ns[k];
             if st.first.is_some_and(|f| f != base[k]) {
@@ -369,20 +429,9 @@ fn merge(chunks: Vec<Chunk>, threads: usize) -> Option<Env> {
             if st.pre_max.is_some_and(|p| p >= base[k]) {
                 return None;
             }
-            base[k] += st.count;
         }
-        for (j, w) in names.into_iter().enumerate() {
-            let (id, fresh) = match w {
-                WName::Str(p, off, len) => {
-                    let bytes = names_buf.get(off as usize..off as usize + len as usize)?;
-                    env.intern_str(p, std::str::from_utf8(bytes).ok()?)
-                }
-                WName::Num(p, n) => env.intern_num(p, n),
-            };
-            // Canonical id == file index needs every name to be new.
-            if !fresh || id as u64 != start[0] + j as u64 {
-                return None;
-            }
+        for k in 0..3 {
+            base[k] += ns[k].count;
         }
         let mut smap = Vec::with_capacity(strs.len());
         for s in strs {
@@ -416,40 +465,32 @@ fn merge(chunks: Vec<Chunk>, threads: usize) -> Option<Env> {
         }
         n_exprs += exprs.len();
         n_levels += levels.len();
-        parts.push((exprs, levels, smap, cl_base, nat_base));
+        fills.push((exprs, levels, smap, cl_base, nat_base));
     }
-    let t_a = std::time::Instant::now();
     let mut exprs_out = vec![RawNode { tag: RawTag::BVar, a: 0, b: 0, c: 0 }; n_exprs];
     let mut levels_out = vec![RawLevelNode::Zero; n_levels];
     {
         let mut ex_rest: &mut [RawNode] = &mut exprs_out;
         let mut lv_rest: &mut [RawLevelNode] = &mut levels_out[1..];
-        let mut jobs: Vec<Fill> = Vec::with_capacity(parts.len());
-        for (exprs, levels, smap, cl_base, nat_base) in parts {
+        let mut buckets: Vec<Vec<Fill>> = (0..threads.max(1)).map(|_| Vec::new()).collect();
+        let workers = buckets.len();
+        for (i, (exprs, levels, smap, cl_base, nat_base)) in fills.into_iter().enumerate() {
             let (ex_dst, ex_tail) = std::mem::take(&mut ex_rest).split_at_mut(exprs.len());
             ex_rest = ex_tail;
             let (lv_dst, lv_tail) = std::mem::take(&mut lv_rest).split_at_mut(levels.len());
             lv_rest = lv_tail;
-            jobs.push(Fill { exprs, levels, ex_dst, lv_dst, smap, cl_base, nat_base });
+            buckets[i % workers].push(Fill { exprs, levels, ex_dst, lv_dst, smap, cl_base, nat_base });
         }
-        let workers = threads.max(1);
-        let mut buckets: Vec<Vec<Fill>> = (0..workers).map(|_| Vec::new()).collect();
-        for (i, job) in jobs.into_iter().enumerate() {
-            buckets[i % workers].push(job);
-        }
-        let ok = thread::scope(|s| {
+        let filled = thread::scope(|s| {
             let hs: Vec<_> = buckets
                 .into_iter()
                 .map(|b| s.spawn(move || b.into_iter().all(|job| fill(job).is_some())))
                 .collect();
             hs.into_iter().all(|h| h.join().unwrap_or(false))
         });
-        if !ok {
+        if !filled {
             return None;
         }
-    }
-    if std::env::var_os("PALLADIUM_TRACE").is_some() {
-        eprintln!("trace: merge fill {:.3}s, names {} exprs {}", t_a.elapsed().as_secs_f64(), env.names.len(), n_exprs);
     }
     env.exprs = exprs_out;
     env.levels = levels_out;
@@ -613,6 +654,7 @@ mod tests {
         for text in [
             "",
             "\n\n",
+            META,
             r#"{"meta":{"format":{"version":"4.0.0"}}}"#,
             r#"{"in":1,"str":{"pre":0,"str":"a"}}"#,
         ] {
