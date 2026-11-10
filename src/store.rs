@@ -10,6 +10,10 @@ use crate::env::NameId;
 use crate::util::{mix, FxHashMap};
 
 pub type TermId = u32;
+
+/// `instantiate` memoises shared subterms only after this many visited nodes: most calls are
+/// small (a few dozen nodes) and their memo traffic costs more than the sharing it finds.
+const INST_MEMO_AFTER: u32 = 64;
 pub type LevelId = u32;
 pub type LocalId = u32;
 pub type LevelsId = u32;
@@ -342,6 +346,8 @@ pub struct Store {
     pub(crate) nat_vals: Vec<BigNat>,
     pub(crate) nat_map: FxHashMap<BigNat, NatId>,
     pub(crate) inst_memo: Memo,
+    /// Nodes visited by the current `instantiate`; the memo is used only past `INST_MEMO_AFTER`.
+    inst_steps: u32,
     pub(crate) abs_memo: Memo,
     pub(crate) subst_memo: Memo,
     /// Shared stack for application spines during substitution (used with a base index).
@@ -374,6 +380,7 @@ impl Store {
             nat_vals: Vec::new(),
             nat_map: FxHashMap::default(),
             inst_memo: Memo::new(),
+            inst_steps: 0,
             abs_memo: Memo::new(),
             subst_memo: Memo::new(),
             spine: Vec::new(),
@@ -724,6 +731,7 @@ impl Store {
         }
         debug_assert!(xs.iter().all(|&x| self.is_closed(x)), "instantiate: open substitution");
         self.inst_memo.begin();
+        self.inst_steps = 0;
         self.inst_rec(t, 0, xs)
     }
 
@@ -744,9 +752,13 @@ impl Store {
             }
             T_APP => self.inst_app(t, off, xs),
             T_LAM | T_PI | T_LET | T_PROJ => {
+                self.inst_steps += 1;
+                let memo = self.inst_steps > INST_MEMO_AFTER;
                 let key = memo_key(t, off);
-                if let Some(r) = self.inst_memo.get(key) {
-                    return r;
+                if memo {
+                    if let Some(r) = self.inst_memo.get(key) {
+                        return r;
+                    }
                 }
                 let r = match n.tag {
                     T_LAM => {
@@ -770,7 +782,9 @@ impl Store {
                         self.mk_proj(n.a, n.b, e)
                     }
                 };
-                self.inst_memo.put(key, r);
+                if memo {
+                    self.inst_memo.put(key, r);
+                }
                 r
             }
             _ => t,
@@ -778,9 +792,13 @@ impl Store {
     }
 
     fn inst_app(&mut self, t: TermId, off: u32, xs: &[TermId]) -> TermId {
+        self.inst_steps += 1;
+        let memo = self.inst_steps > INST_MEMO_AFTER;
         let key = memo_key(t, off);
-        if let Some(r) = self.inst_memo.get(key) {
-            return r;
+        if memo {
+            if let Some(r) = self.inst_memo.get(key) {
+                return r;
+            }
         }
         let base_len = self.spine.len();
         let base = self.push_spine(t, |m| m.lbr > off);
@@ -792,7 +810,7 @@ impl Store {
             let arg = self.nodes[node as usize].b;
             let ai = self.inst_rec(arg, off, xs);
             r = self.mk_app(r, ai);
-            if i == base_len {
+            if memo && i == base_len {
                 self.inst_memo.put(memo_key(node, off), r);
             }
         }
