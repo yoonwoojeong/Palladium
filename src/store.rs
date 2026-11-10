@@ -793,7 +793,9 @@ impl Store {
             let arg = self.nodes[node as usize].b;
             let ai = self.inst_rec(arg, off, xs);
             r = self.mk_app(r, ai);
-            self.inst_memo.put(memo_key(node, off), r);
+            if i == base_len {
+                self.inst_memo.put(memo_key(node, off), r);
+            }
         }
         self.spine.truncate(base_len);
         r
@@ -906,7 +908,9 @@ impl Store {
             let arg = self.nodes[node as usize].b;
             let ai = self.abs_rec(arg, off, ctx);
             r = self.mk_app(r, ai);
-            self.abs_memo.put(memo_key(node, off), r);
+            if i == base_len {
+                self.abs_memo.put(memo_key(node, off), r);
+            }
         }
         self.spine.truncate(base_len);
         r
@@ -997,7 +1001,9 @@ impl Store {
             let arg = self.nodes[node as usize].b;
             let ai = self.subst_rec(arg, params, ls);
             r = self.mk_app(r, ai);
-            self.subst_memo.put(node as u64, r);
+            if i == base_len {
+                self.subst_memo.put(node as u64, r);
+            }
         }
         self.spine.truncate(base_len);
         r
