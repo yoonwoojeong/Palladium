@@ -97,6 +97,23 @@ pub struct Checker<'e> {
     nat_ok: FxHashMap<NameId, bool>,
     success: FxHashSet<(TermId, TermId)>,
     failure: FxHashSet<(TermId, TermId)>,
+    /// Inference context of `infer_ctx`: closed entries, their interned prefix ids
+    /// (`ctx_intern`, id 0 = empty), and the running max of their `local_ub`.
+    ctx: Vec<TermId>,
+    ctx_id: Vec<u32>,
+    ctx_ub: Vec<u32>,
+    ctx_intern: FxHashMap<(u32, TermId), u32>,
+    /// `infer_ctx` results for open terms, keyed by `(term << 32) | CtxId`.
+    infer_open_chk: FxHashMap<u64, TermId>,
+    infer_open_only: FxHashMap<u64, TermId>,
+    /// Closed instances of open terms, keyed by `(term, binder offset, CtxId)`.
+    inst_memo: FxHashMap<(TermId, u32, u32), TermId>,
+    /// Caches of the substitution-based oracle `infer_subst`.
+    sub_chk: DenseMap,
+    sub_only: DenseMap,
+    /// `PALLADIUM_CHECK_INFER=1`: every top-level `infer` also runs `infer_subst` and compares.
+    check_infer: bool,
+    in_oracle: bool,
 }
 
 impl<'e> Checker<'e> {
@@ -123,6 +140,17 @@ impl<'e> Checker<'e> {
             nat_ok: FxHashMap::default(),
             success: FxHashSet::default(),
             failure: FxHashSet::default(),
+            ctx: Vec::new(),
+            ctx_id: Vec::new(),
+            ctx_ub: Vec::new(),
+            ctx_intern: FxHashMap::default(),
+            infer_open_chk: FxHashMap::default(),
+            infer_open_only: FxHashMap::default(),
+            inst_memo: FxHashMap::default(),
+            sub_chk: DenseMap::default(),
+            sub_only: DenseMap::default(),
+            check_infer: std::env::var("PALLADIUM_CHECK_INFER").map_or(false, |v| v == "1"),
+            in_oracle: false,
         };
         c.reset();
         c
@@ -156,6 +184,15 @@ impl<'e> Checker<'e> {
         self.unfold_c.clear();
         self.rule_c.clear();
         self.nat_ok.clear();
+        self.ctx.clear();
+        self.ctx_id.clear();
+        self.ctx_ub.clear();
+        self.ctx_intern.clear();
+        self.infer_open_chk.clear();
+        self.infer_open_only.clear();
+        self.inst_memo.clear();
+        self.sub_chk.clear();
+        self.sub_only.clear();
         self.clear_def_caches();
     }
 
@@ -425,33 +462,381 @@ impl<'e> Checker<'e> {
     }
 
     // ----- typing ----------------------------------------------------------------
+    //
+    // `infer_ctx` is the implementation (docs/EVAL.md Part B). The context is a stack of
+    // closed terms `ctx`: a `Local` for each enclosing Lam/Pi binder, the instantiated value
+    // for each enclosing let. A loose bvar `i` of the term being inferred refers to
+    // `ctx[len-1-i]`, so no binder body is ever substituted. `infer_subst*` is the old
+    // substitution-based code, kept as the oracle for `PALLADIUM_CHECK_INFER=1`.
 
     pub fn check(&mut self, t: TermId) -> R<TermId> {
         self.infer(t, true)
     }
 
-    /// The type of `t`. `check == false` assumes `t` is well typed.
+    /// The type of the closed term `t`. `check == false` assumes `t` is well typed.
     pub fn infer(&mut self, t: TermId, check: bool) -> R<TermId> {
+        if self.store.lbr(t) > 0 {
+            return reject("type checker does not support loose bound variables");
+        }
+        if !self.check_infer || self.in_oracle {
+            return self.infer_top(t, check);
+        }
+        // Oracle: the new result must equal (or be def-eq to) the substitution-based one.
+        let new = self.infer_top(t, check);
+        self.in_oracle = true;
+        let old = self.infer_subst(t, check);
+        let agree = match (&new, &old) {
+            (Ok(n), Ok(o)) => *n == *o || matches!(self.is_def_eq(*n, *o), Ok(true)),
+            (Err(_), Err(_)) => true,
+            _ => false,
+        };
+        if !agree {
+            let show_new = match &new {
+                Ok(n) => self.show(*n),
+                Err(e) => format!("{e:?}"),
+            };
+            let show_old = match &old {
+                Ok(o) => self.show(*o),
+                Err(e) => format!("{e:?}"),
+            };
+            self.in_oracle = false;
+            panic!(
+                "PALLADIUM_CHECK_INFER: infer disagrees on {}\n  new: {}\n  old: {}",
+                self.show(t),
+                show_new,
+                show_old
+            );
+        }
+        self.in_oracle = false;
+        new
+    }
+
+    /// `infer_ctx` with an empty context (the context of a closed term).
+    fn infer_top(&mut self, t: TermId, check: bool) -> R<TermId> {
+        if self.ctx.is_empty() {
+            return self.infer_ctx(t, check);
+        }
+        let ctx = std::mem::take(&mut self.ctx);
+        let ids = std::mem::take(&mut self.ctx_id);
+        let ubs = std::mem::take(&mut self.ctx_ub);
+        let r = self.infer_ctx(t, check);
+        self.ctx = ctx;
+        self.ctx_id = ids;
+        self.ctx_ub = ubs;
+        r
+    }
+
+    // ----- context ---------------------------------------------------------------
+
+    #[inline]
+    fn ctx_cur_id(&self) -> u32 {
+        self.ctx_id.last().copied().unwrap_or(0)
+    }
+
+    #[inline]
+    fn ctx_cur_ub(&self) -> u32 {
+        self.ctx_ub.last().copied().unwrap_or(0)
+    }
+
+    /// Pushes a closed entry; `ctx_id` interns the prefix, `ctx_ub` is the running max of `local_ub`.
+    fn ctx_push(&mut self, e: TermId) {
+        let parent = self.ctx_cur_id();
+        let next = self.ctx_intern.len() as u32 + 1;
+        let id = *self.ctx_intern.entry((parent, e)).or_insert(next);
+        let ub = self.ctx_cur_ub().max(self.store.local_ub(e));
+        self.ctx.push(e);
+        self.ctx_id.push(id);
+        self.ctx_ub.push(ub);
+    }
+
+    fn ctx_pop(&mut self) {
+        self.ctx.pop();
+        self.ctx_id.pop();
+        self.ctx_ub.pop();
+    }
+
+    /// A fresh local for the binder of `t` with closed domain `dom`. Its depth is at least the
+    /// context's `ctx_ub` and the `local_ub` of `t` and `dom`, so it occurs in nothing else (P2).
+    fn fresh_ctx_local(&mut self, t: TermId, dom: TermId) -> TermId {
+        let d = self.ctx_cur_ub().max(self.store.local_ub(t)).max(self.store.local_ub(dom));
+        self.store.mk_local(d, dom)
+    }
+
+    /// The closed instance of `t` under the current context (`t` itself when closed).
+    /// Memoised on (subterm, binder offset, CtxId) across calls.
+    fn inst_ctx(&mut self, t: TermId) -> R<TermId> {
+        if self.store.lbr(t) == 0 {
+            return Ok(t);
+        }
+        self.inst_rec(t, 0)
+    }
+
+    fn inst_rec(&mut self, t: TermId, off: u32) -> R<TermId> {
+        if self.store.lbr(t) <= off {
+            return Ok(t);
+        }
+        let key = (t, off, self.ctx_cur_id());
+        if let Some(&r) = self.inst_memo.get(&key) {
+            return Ok(r);
+        }
+        let r = match self.store.get(t) {
+            Term::BVar(i) => {
+                // lbr(t) > off, so i >= off.
+                let k = (i - off) as usize;
+                let len = self.ctx.len();
+                if k >= len {
+                    return reject("loose bound variable");
+                }
+                self.ctx[len - 1 - k]
+            }
+            Term::App(f, a) => {
+                let f2 = self.inst_rec(f, off)?;
+                let a2 = self.inst_rec(a, off)?;
+                self.store.mk_app(f2, a2)
+            }
+            Term::Lam(d, b) => {
+                let d2 = self.inst_rec(d, off)?;
+                let b2 = self.inst_rec(b, off + 1)?;
+                self.store.mk_lam(d2, b2)
+            }
+            Term::Pi(d, b) => {
+                let d2 = self.inst_rec(d, off)?;
+                let b2 = self.inst_rec(b, off + 1)?;
+                self.store.mk_pi(d2, b2)
+            }
+            Term::Let(ty, v, b) => {
+                let ty2 = self.inst_rec(ty, off)?;
+                let v2 = self.inst_rec(v, off)?;
+                let b2 = self.inst_rec(b, off + 1)?;
+                self.store.mk_let(ty2, v2, b2)
+            }
+            Term::Proj(s, i, e) => {
+                let e2 = self.inst_rec(e, off)?;
+                self.store.mk_proj(s, i, e2)
+            }
+            _ => t,
+        };
+        self.inst_memo.insert(key, r);
+        Ok(r)
+    }
+
+    /// Checks `inst(ft)` for the pending arguments `args` (binder order, outermost first).
+    /// Instances are built only when `ft` has loose bvars.
+    fn inst_pending(&mut self, ft: TermId, args: &[TermId]) -> R<TermId> {
+        if args.is_empty() || self.store.lbr(ft) == 0 {
+            return Ok(ft);
+        }
+        let mut xs = Vec::with_capacity(args.len());
+        for &a in args {
+            xs.push(self.inst_ctx(a)?);
+        }
+        Ok(self.store.instantiate(ft, &xs))
+    }
+
+    // ----- infer_ctx -------------------------------------------------------------
+
+    fn infer_ctx(&mut self, t: TermId, check: bool) -> R<TermId> {
         self.depth += 1;
         if self.depth > MAX_DEPTH {
             self.depth -= 1;
             return fault("recursion depth exceeded");
         }
-        let r = self.infer_core(t, check);
+        let r = self.infer_ctx_core(t, check);
         self.depth -= 1;
         r
     }
 
-    fn infer_core(&mut self, t: TermId, check: bool) -> R<TermId> {
+    fn infer_ctx_core(&mut self, t: TermId, check: bool) -> R<TermId> {
         self.stats[0] += 1;
+        let closed = self.store.lbr(t) == 0;
+        let key = ((t as u64) << 32) | self.ctx_cur_id() as u64;
+        if closed {
+            if let Some(r) = self.infer_chk.get(t) {
+                return Ok(r);
+            }
+            if !check {
+                if let Some(r) = self.infer_only.get(t) {
+                    return Ok(r);
+                }
+            }
+        } else {
+            if let Some(&r) = self.infer_open_chk.get(&key) {
+                return Ok(r);
+            }
+            if !check {
+                if let Some(&r) = self.infer_open_only.get(&key) {
+                    return Ok(r);
+                }
+            }
+        }
+        let r = self.infer_node(t, check)?;
+        match (closed, check) {
+            (true, true) => self.infer_chk.insert(t, r),
+            (true, false) => self.infer_only.insert(t, r),
+            (false, true) => {
+                self.infer_open_chk.insert(key, r);
+            }
+            (false, false) => {
+                self.infer_open_only.insert(key, r);
+            }
+        }
+        Ok(r)
+    }
+
+    fn infer_node(&mut self, t: TermId, check: bool) -> R<TermId> {
+        match self.store.get(t) {
+            Term::BVar(i) => {
+                let len = self.ctx.len();
+                if i as usize >= len {
+                    return reject("loose bound variable");
+                }
+                let e = self.ctx[len - 1 - i as usize];
+                self.infer_ctx(e, check)
+            }
+            Term::Local(l) => Ok(self.store.local_type(l)),
+            Term::Sort(l) => {
+                let s = self.store.mk_succ(l);
+                Ok(self.store.mk_sort(s))
+            }
+            Term::Const(n, ls) => self.infer_const(n, ls, check),
+            Term::App(..) => self.infer_app_ctx(t, check),
+            Term::Lam(..) => self.infer_lambda_ctx(t, check),
+            Term::Pi(..) => self.infer_pi_ctx(t, check),
+            Term::Let(ty, v, b) => self.infer_let_ctx(ty, v, b, check),
+            Term::Proj(s, i, e) => {
+                if self.store.lbr(t) == 0 {
+                    let ty0 = self.infer_ctx(e, check)?;
+                    self.proj_type(s, i, e, ty0)
+                } else {
+                    let c = self.inst_ctx(t)?;
+                    self.infer(c, check)
+                }
+            }
+            Term::Nat(_) | Term::Str(_) => self.infer_lit(t, check),
+        }
+    }
+
+    fn infer_app_ctx(&mut self, t: TermId, check: bool) -> R<TermId> {
+        if check {
+            let Term::App(f, a) = self.store.get(t) else { return fault("infer_app") };
+            let ft0 = self.infer_ctx(f, true)?;
+            let (dom, body) = self.ensure_pi(ft0)?;
+            let at = self.infer_ctx(a, true)?;
+            if !self.check_arg(a, at, dom)? {
+                return reject("application type mismatch");
+            }
+            if self.store.lbr(body) == 0 {
+                return Ok(body);
+            }
+            let ai = self.inst_ctx(a)?;
+            Ok(self.store.instantiate(body, &[ai]))
+        } else {
+            let mut args = self.take_buf();
+            let f = self.store.unfold_app(t, &mut args);
+            let r = self.infer_spine_ctx(f, &args);
+            self.give_buf(args);
+            r
+        }
+    }
+
+    /// Infer-only spine: the codomain is instantiated lazily, only when it has loose bvars.
+    fn infer_spine_ctx(&mut self, f: TermId, args: &[TermId]) -> R<TermId> {
+        let mut ft = self.infer_ctx(f, false)?;
+        let mut j = 0;
+        for i in 0..args.len() {
+            if let Term::Pi(_, b) = self.store.get(ft) {
+                ft = b;
+            } else {
+                ft = self.inst_pending(ft, &args[j..i])?;
+                let (_, b) = self.ensure_pi(ft)?;
+                ft = b;
+                j = i;
+            }
+        }
+        self.inst_pending(ft, &args[j..])
+    }
+
+    fn infer_lambda_ctx(&mut self, t: TermId, check: bool) -> R<TermId> {
+        let Term::Lam(ty, b) = self.store.get(t) else { return fault("infer_lambda") };
+        let dom = self.inst_ctx(ty)?;
+        if check {
+            let s = self.infer_ctx(dom, true)?;
+            self.ensure_sort(s)?;
+        }
+        if self.store.lbr(b) == 0 {
+            let r = self.infer_ctx(b, check)?;
+            return Ok(self.store.mk_pi(dom, r));
+        }
+        let x = self.fresh_ctx_local(t, dom);
+        self.ctx_push(x);
+        let r = self.infer_ctx(b, check);
+        self.ctx_pop();
+        let r = self.store.abstract_locals(r?, &[x]);
+        Ok(self.store.mk_pi(dom, r))
+    }
+
+    fn infer_pi_ctx(&mut self, t: TermId, check: bool) -> R<TermId> {
+        let Term::Pi(ty, b) = self.store.get(t) else { return fault("infer_pi") };
+        let dom = self.inst_ctx(ty)?;
+        let s = self.infer_ctx(dom, check)?;
+        let u = self.ensure_sort(s)?;
+        let s2 = if self.store.lbr(b) == 0 {
+            self.infer_ctx(b, check)?
+        } else {
+            let x = self.fresh_ctx_local(t, dom);
+            self.ctx_push(x);
+            let r = self.infer_ctx(b, check);
+            self.ctx_pop();
+            r?
+        };
+        let v = self.ensure_sort(s2)?;
+        let r = self.store.mk_imax(u, v);
+        Ok(self.store.mk_sort(r))
+    }
+
+    fn infer_let_ctx(&mut self, ty: TermId, v: TermId, b: TermId, check: bool) -> R<TermId> {
+        let dom = self.inst_ctx(ty)?;
+        let vi = self.inst_ctx(v)?;
+        if check {
+            let s = self.infer_ctx(dom, true)?;
+            self.ensure_sort(s)?;
+            let vt = self.infer_ctx(vi, true)?;
+            if !self.is_def_eq(vt, dom)? {
+                return reject("let value type mismatch");
+            }
+        }
+        if self.store.lbr(b) == 0 {
+            return self.infer_ctx(b, check);
+        }
+        self.ctx_push(vi);
+        let r = self.infer_ctx(b, check);
+        self.ctx_pop();
+        r
+    }
+
+    // ----- infer (substitution-based oracle) -------------------------------------
+
+    /// The old implementation: binders are opened by substituting into the body.
+    fn infer_subst(&mut self, t: TermId, check: bool) -> R<TermId> {
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            self.depth -= 1;
+            return fault("recursion depth exceeded");
+        }
+        let r = self.infer_subst_core(t, check);
+        self.depth -= 1;
+        r
+    }
+
+    fn infer_subst_core(&mut self, t: TermId, check: bool) -> R<TermId> {
         if self.store.lbr(t) > 0 {
             return reject("type checker does not support loose bound variables");
         }
-        if let Some(r) = self.infer_chk.get(t) {
+        if let Some(r) = self.sub_chk.get(t) {
             return Ok(r);
         }
         if !check {
-            if let Some(r) = self.infer_only.get(t) {
+            if let Some(r) = self.sub_only.get(t) {
                 return Ok(r);
             }
         }
@@ -463,81 +848,38 @@ impl<'e> Checker<'e> {
                 self.store.mk_sort(s)
             }
             Term::Const(n, ls) => self.infer_const(n, ls, check)?,
-            Term::App(..) => self.infer_app(t, check)?,
-            Term::Lam(..) => self.infer_lambda(t, check)?,
-            Term::Pi(..) => self.infer_pi(t, check)?,
-            Term::Let(ty, v, b) => self.infer_let(ty, v, b, check)?,
-            Term::Proj(s, i, e) => self.infer_proj(s, i, e, check)?,
-            Term::Nat(_) => {
-                let n = match self.env.builtins.nat_ty {
-                    Some(n) => n,
-                    None => return reject("Nat literal but Nat is not declared"),
-                };
-                if check {
-                    self.const_info(n)?;
-                }
-                let lv = self.store.mk_levels(&[]);
-                self.store.mk_const(n, lv)
+            Term::App(..) => self.infer_app_subst(t, check)?,
+            Term::Lam(..) => self.infer_lambda_subst(t, check)?,
+            Term::Pi(..) => self.infer_pi_subst(t, check)?,
+            Term::Let(ty, v, b) => self.infer_let_subst(ty, v, b, check)?,
+            Term::Proj(s, i, e) => {
+                let ty0 = self.infer_subst(e, check)?;
+                self.proj_type(s, i, e, ty0)?
             }
-            Term::Str(_) => {
-                let n = match self.env.builtins.string_ty {
-                    Some(n) => n,
-                    None => return reject("string literal but String is not declared"),
-                };
-                if check {
-                    self.const_info(n)?;
-                }
-                let lv = self.store.mk_levels(&[]);
-                self.store.mk_const(n, lv)
-            }
+            Term::Nat(_) | Term::Str(_) => self.infer_lit(t, check)?,
         };
         if check {
-            self.infer_chk.insert(t, r);
+            self.sub_chk.insert(t, r);
         } else {
-            self.infer_only.insert(t, r);
+            self.sub_only.insert(t, r);
         }
         Ok(r)
     }
 
-    fn infer_const(&mut self, n: NameId, ls: LevelsId, check: bool) -> R<TermId> {
-        let info = self.const_info(n)?;
-        if check && info.is_unsafe && self.safe_mode {
-            return reject(format!("safe declaration uses unsafe constant '{}'", self.env.raw.name_to_string(n)));
-        }
-        self.const_type(n, ls)
-    }
-
-    fn is_eager_reduce_arg(&self, a: TermId) -> bool {
-        let Some(en) = self.env.builtins.eager_reduce else { return false };
-        if self.store.app_num_args(a) != 2 {
-            return false;
-        }
-        matches!(self.store.get(self.store.app_fn(a)), Term::Const(n, _) if n == en)
-    }
-
-    fn infer_app(&mut self, t: TermId, check: bool) -> R<TermId> {
+    fn infer_app_subst(&mut self, t: TermId, check: bool) -> R<TermId> {
         if check {
             let Term::App(f, a) = self.store.get(t) else { return fault("infer_app") };
-            let ft0 = self.infer(f, true)?;
+            let ft0 = self.infer_subst(f, true)?;
             let (dom, body) = self.ensure_pi(ft0)?;
-            let at = self.infer(a, true)?;
-            let ok = if self.is_eager_reduce_arg(a) {
-                let old = self.eager_reduce;
-                self.eager_reduce = true;
-                let r = self.is_def_eq(at, dom);
-                self.eager_reduce = old;
-                r?
-            } else {
-                self.is_def_eq(at, dom)?
-            };
-            if !ok {
+            let at = self.infer_subst(a, true)?;
+            if !self.check_arg(a, at, dom)? {
                 return reject("application type mismatch");
             }
             Ok(self.store.instantiate(body, &[a]))
         } else {
             let mut args = Vec::new();
             let f = self.store.unfold_app(t, &mut args);
-            let mut ft = self.infer(f, false)?;
+            let mut ft = self.infer_subst(f, false)?;
             let mut j = 0;
             for i in 0..args.len() {
                 if let Term::Pi(_, b) = self.store.get(ft) {
@@ -553,7 +895,7 @@ impl<'e> Checker<'e> {
         }
     }
 
-    fn infer_lambda(&mut self, t: TermId, check: bool) -> R<TermId> {
+    fn infer_lambda_subst(&mut self, t: TermId, check: bool) -> R<TermId> {
         let (xs, doms, body) = self.open_telescope(t, true);
         if check {
             for &x in &xs {
@@ -561,11 +903,11 @@ impl<'e> Checker<'e> {
                     Term::Local(l) => self.store.local_type(l),
                     _ => return fault("open_telescope"),
                 };
-                let s = self.infer(d, true)?;
+                let s = self.infer_subst(d, true)?;
                 self.ensure_sort(s)?;
             }
         }
-        let r = self.infer(body, check)?;
+        let r = self.infer_subst(body, check)?;
         let mut res = self.store.abstract_locals(r, &xs);
         for i in (0..xs.len()).rev() {
             res = self.store.mk_pi(doms[i], res);
@@ -573,7 +915,7 @@ impl<'e> Checker<'e> {
         Ok(res)
     }
 
-    fn infer_pi(&mut self, t: TermId, check: bool) -> R<TermId> {
+    fn infer_pi_subst(&mut self, t: TermId, check: bool) -> R<TermId> {
         let (xs, _doms, body) = self.open_telescope(t, false);
         let mut us = Vec::with_capacity(xs.len());
         for &x in &xs {
@@ -581,10 +923,10 @@ impl<'e> Checker<'e> {
                 Term::Local(l) => self.store.local_type(l),
                 _ => return fault("open_telescope"),
             };
-            let s = self.infer(d, check)?;
+            let s = self.infer_subst(d, check)?;
             us.push(self.ensure_sort(s)?);
         }
-        let s = self.infer(body, check)?;
+        let s = self.infer_subst(body, check)?;
         let mut r = self.ensure_sort(s)?;
         for &u in us.iter().rev() {
             r = self.store.mk_imax(u, r);
@@ -592,21 +934,66 @@ impl<'e> Checker<'e> {
         Ok(self.store.mk_sort(r))
     }
 
-    fn infer_let(&mut self, ty: TermId, v: TermId, b: TermId, check: bool) -> R<TermId> {
+    fn infer_let_subst(&mut self, ty: TermId, v: TermId, b: TermId, check: bool) -> R<TermId> {
         if check {
-            let s = self.infer(ty, true)?;
+            let s = self.infer_subst(ty, true)?;
             self.ensure_sort(s)?;
-            let vt = self.infer(v, true)?;
+            let vt = self.infer_subst(v, true)?;
             if !self.is_def_eq(vt, ty)? {
                 return reject("let value type mismatch");
             }
         }
         let body = self.store.instantiate(b, &[v]);
-        self.infer(body, check)
+        self.infer_subst(body, check)
     }
 
-    fn infer_proj(&mut self, sname: NameId, idx: u32, e: TermId, check: bool) -> R<TermId> {
-        let ty0 = self.infer(e, check)?;
+    // ----- shared helpers --------------------------------------------------------
+
+    fn is_eager_reduce_arg(&self, a: TermId) -> bool {
+        let Some(en) = self.env.builtins.eager_reduce else { return false };
+        if self.store.app_num_args(a) != 2 {
+            return false;
+        }
+        matches!(self.store.get(self.store.app_fn(a)), Term::Const(n, _) if n == en)
+    }
+
+    /// Argument `a` of type `at` against the domain `dom` (both closed); `eagerReduce` arguments
+    /// are compared with the `Bool.true` shortcut enabled.
+    fn check_arg(&mut self, a: TermId, at: TermId, dom: TermId) -> R<bool> {
+        if self.is_eager_reduce_arg(a) {
+            let old = self.eager_reduce;
+            self.eager_reduce = true;
+            let r = self.is_def_eq(at, dom);
+            self.eager_reduce = old;
+            r
+        } else {
+            self.is_def_eq(at, dom)
+        }
+    }
+
+    fn infer_const(&mut self, n: NameId, ls: LevelsId, check: bool) -> R<TermId> {
+        let info = self.const_info(n)?;
+        if check && info.is_unsafe && self.safe_mode {
+            return reject(format!("safe declaration uses unsafe constant '{}'", self.env.raw.name_to_string(n)));
+        }
+        self.const_type(n, ls)
+    }
+
+    fn infer_lit(&mut self, t: TermId, check: bool) -> R<TermId> {
+        let (name, msg) = match self.store.get(t) {
+            Term::Nat(_) => (self.env.builtins.nat_ty, "Nat literal but Nat is not declared"),
+            _ => (self.env.builtins.string_ty, "string literal but String is not declared"),
+        };
+        let Some(n) = name else { return reject(msg) };
+        if check {
+            self.const_info(n)?;
+        }
+        let lv = self.store.mk_levels(&[]);
+        Ok(self.store.mk_const(n, lv))
+    }
+
+    /// The type of `Proj(sname, idx, e)` given the closed type `ty0` of `e` (M9).
+    fn proj_type(&mut self, sname: NameId, idx: u32, e: TermId, ty0: TermId) -> R<TermId> {
         let ty = self.whnf(ty0)?;
         let mut args = Vec::new();
         let head = self.store.unfold_app(ty, &mut args);
