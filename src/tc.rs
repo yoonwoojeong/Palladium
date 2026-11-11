@@ -88,6 +88,8 @@ pub struct Checker<'e> {
     /// Import memos (file index -> store id), generation-stamped and sized by what is live.
     imp_expr: GenMap,
     imp_level: GenMap,
+    /// Scratch buffer for the level list of an imported constant.
+    lvl_buf: Vec<LevelId>,
     /// Reusable argument buffers (see `take_buf` / `give_buf`).
     buf_pool: Vec<Vec<TermId>>,
     infer_chk: DenseMap,
@@ -148,6 +150,7 @@ impl<'e> Checker<'e> {
             imp_count: 0,
             imp_expr: GenMap::default(),
             imp_level: GenMap::default(),
+            lvl_buf: Vec::new(),
             buf_pool: Vec::new(),
             infer_chk: DenseMap::default(),
             infer_only: DenseMap::default(),
@@ -305,12 +308,15 @@ impl<'e> Checker<'e> {
                 self.store.mk_sort(l)
             }
             RawTag::Const => {
-                let mut ls = Vec::with_capacity(n.c as usize);
+                // `import_level` does not touch the buffer, so it is reused across constants.
+                let mut ls = std::mem::take(&mut self.lvl_buf);
+                ls.clear();
                 for i in 0..n.c as usize {
                     let rl = env.raw.const_levels[n.b as usize + i];
                     ls.push(self.import_level(rl));
                 }
                 let lv = self.store.mk_levels(&ls);
+                self.lvl_buf = ls;
                 self.store.mk_const(n.a, lv)
             }
             RawTag::App => {

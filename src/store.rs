@@ -332,6 +332,8 @@ impl<'a> AbsCtx<'a> {
 pub struct Store {
     pub(crate) nodes: Vec<Entry>,
     pub(crate) term_tab: Table,
+    /// Scratch buffer for the level list of a substituted constant.
+    lvl_buf: Vec<LevelId>,
     pub(crate) lnodes: Vec<LNode>,
     pub(crate) lmeta: Vec<LMeta>,
     pub(crate) level_tab: Table,
@@ -366,6 +368,7 @@ impl Store {
         let mut s = Store {
             nodes: Vec::new(),
             term_tab: Table::new(),
+            lvl_buf: Vec::new(),
             lnodes: Vec::new(),
             lmeta: Vec::new(),
             level_tab: Table::new(),
@@ -966,12 +969,15 @@ impl Store {
                 self.mk_sort(l)
             }
             T_CONST => {
-                let old: Vec<LevelId> = self.levels(n.b).to_vec();
-                let mut new = Vec::with_capacity(old.len());
-                for l in old {
+                // `level_subst` does not touch the buffer, so it is reused across constants.
+                let mut new = std::mem::take(&mut self.lvl_buf);
+                new.clear();
+                for i in 0..self.list_len[n.b as usize] as usize {
+                    let l = self.levels(n.b)[i];
                     new.push(self.level_subst(l, params, ls));
                 }
                 let lv = self.mk_levels(&new);
+                self.lvl_buf = new;
                 self.mk_const(n.a, lv)
             }
             T_LOCAL => {
