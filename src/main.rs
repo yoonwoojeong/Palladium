@@ -16,7 +16,9 @@ use palladium::tc::{Checker, Fail};
 
 const STACK_SIZES: [usize; 3] = [4 << 30, 1 << 30, 256 << 20];
 /// A worker recreates its store between declarations once it holds more terms than this.
-const RESET_TERMS: usize = 250_000;
+/// The store and the caches indexed by term id then stay within the per-core cache: on the
+/// Mathlib export 100k checks about 5% faster than 250k, and 40k to 60k is no better.
+const RESET_TERMS: usize = 100_000;
 
 struct Opts {
     jobs: Option<usize>,
@@ -122,6 +124,8 @@ fn worker(env: &Env, counter: &AtomicUsize, fault: &Mutex<Option<String>>, total
     let trace = std::env::var_os("PALLADIUM_TRACE").is_some();
     let stats_on = std::env::var_os("PALLADIUM_STATS").is_some();
     let only_pos: Option<usize> = std::env::var("PALLADIUM_ONLY_POS").ok().and_then(|v| v.parse().ok());
+    // Diagnostics only: `PALLADIUM_SAMPLE=<k>` checks every k-th declaration (for quick A/B timing).
+    let sample: Option<usize> = std::env::var("PALLADIUM_SAMPLE").ok().and_then(|v| v.parse().ok()).filter(|&k| k >= 1);
     // Diagnostics: `PALLADIUM_RESET_TERMS=<n>` overrides the store size that triggers a reset.
     let reset_terms: usize = std::env::var("PALLADIUM_RESET_TERMS").ok().and_then(|v| v.parse().ok()).unwrap_or(RESET_TERMS);
     let t_loop = std::time::Instant::now();
@@ -135,7 +139,7 @@ fn worker(env: &Env, counter: &AtomicUsize, fault: &Mutex<Option<String>>, total
         }
         // Diagnostics only: `PALLADIUM_ONLY_POS=<n>` checks just declaration n (the environment
         // still holds all declarations, so n is checked as it would be in the full run).
-        if only_pos.map_or(false, |o| o != p) {
+        if only_pos.map_or(false, |o| o != p) || sample.map_or(false, |k| p % k != 0) {
             continue;
         }
         if checker.store.num_terms() > reset_terms {
@@ -234,7 +238,8 @@ fn rss_field(key: &str) -> u64 {
 fn main() {
     panic::set_hook(Box::new(|_| {}));
     let opts = parse_args();
-    let trace = std::env::var_os("PALLADIUM_TRACE").is_some();
+    // The phase summaries (times, RSS) are printed for `PALLADIUM_TRACE` and `PALLADIUM_STATS`.
+    let summary = std::env::var_os("PALLADIUM_TRACE").is_some() || std::env::var_os("PALLADIUM_STATS").is_some();
     let jobs = opts
         .jobs
         .unwrap_or_else(|| thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(8))
@@ -276,7 +281,7 @@ fn main() {
             process::exit(4);
         }
     };
-    if trace {
+    if summary {
         let mode = if opts.sequential { "sequential".to_string() } else { format!("{jobs} threads") };
         eprintln!("trace: read, parse and env build {:.3}s ({mode})", t_parse.elapsed().as_secs_f64());
     }
@@ -291,7 +296,7 @@ fn main() {
             process::exit(2);
         }
     };
-    if trace {
+    if summary {
         eprintln!("trace: peak RSS after load {} KiB, current RSS {} KiB", peak_rss_kib(), current_rss_kib());
     }
     if opts.parse_only {
@@ -330,12 +335,12 @@ fn main() {
         eprintln!("fault: {msg}");
         process::exit(3);
     }
-    if trace {
+    if summary {
         eprintln!("trace: check {:.3}s, peak RSS {} KiB", t_check.elapsed().as_secs_f64(), peak_rss_kib());
     }
     // A partial (diagnostic) run must never be reported as an acceptance of the file.
-    if std::env::var_os("PALLADIUM_ONLY_POS").is_some() {
-        eprintln!("PALLADIUM_ONLY_POS set: only one declaration was checked; declining");
+    if std::env::var_os("PALLADIUM_ONLY_POS").is_some() || std::env::var_os("PALLADIUM_SAMPLE").is_some() {
+        eprintln!("PALLADIUM_ONLY_POS or PALLADIUM_SAMPLE set: not every declaration was checked; declining");
         process::exit(2);
     }
     if !opts.quiet {
